@@ -87,6 +87,30 @@ class PredictorFeedbackFn(Protocol):
 
 
 class DspyAdapter(GEPAAdapter[Example, TraceData, Prediction]):
+    @staticmethod
+    def _default_trace_selector(
+        trace_instances: list,
+        rng: random.Random,
+        prediction: Any = None,
+    ) -> Any | None:
+        """Default trace selection: prefer FailedPrediction, then random.
+
+        Args:
+            trace_instances: Non-empty list of (Predictor, Inputs, Prediction) tuples.
+            rng: Seeded Random instance for deterministic selection.
+            prediction: The module-level prediction (used to skip if it is a FailedPrediction
+                and no failed trace instance was found).
+
+        Returns:
+            A selected trace tuple, or ``None`` to skip this example.
+        """
+        for t in trace_instances:
+            if isinstance(t[2], FailedPrediction):
+                return t
+        if isinstance(prediction, FailedPrediction):
+            return None
+        return rng.choice(trace_instances)
+
     def __init__(
         self,
         student_module,
@@ -101,6 +125,7 @@ class DspyAdapter(GEPAAdapter[Example, TraceData, Prediction]):
         warn_on_score_mismatch: bool = True,
         enable_tool_optimization: bool = False,
         reflection_minibatch_size: int | None = None,
+        trace_selector: "Callable[..., Any] | None" = None,
     ):
         self.student = student_module
         self.metric_fn = metric_fn
@@ -114,6 +139,7 @@ class DspyAdapter(GEPAAdapter[Example, TraceData, Prediction]):
         self.warn_on_score_mismatch = warn_on_score_mismatch
         self.enable_tool_optimization = enable_tool_optimization
         self.reflection_minibatch_size = reflection_minibatch_size
+        self.trace_selector = trace_selector or self._default_trace_selector
 
     def propose_new_texts(
         self,
@@ -375,16 +401,13 @@ class DspyAdapter(GEPAAdapter[Example, TraceData, Prediction]):
                 if len(trace_instances) == 0:
                     continue
 
-                selected = None
-                for t in trace_instances:
-                    if isinstance(t[2], FailedPrediction):
-                        selected = t
-                        break
-
+                selected = self.trace_selector(
+                    trace_instances=trace_instances,
+                    rng=self.rng,
+                    prediction=prediction,
+                )
                 if selected is None:
-                    if isinstance(prediction, FailedPrediction):
-                        continue
-                    selected = self.rng.choice(trace_instances)
+                    continue
 
                 inputs = selected[1]
                 outputs = selected[2]

@@ -122,6 +122,24 @@ Provide the new instructions within ``` blocks."""
         return prompt
 
     @classmethod
+    def run(cls, lm: Any, input_dict: Mapping[str, Any]) -> dict[str, str]:
+        full_prompt = cls.prompt_renderer(input_dict)
+        if isinstance(full_prompt, list):
+            # Multimodal messages list — print the text parts
+            for msg in full_prompt:
+                for part in msg.get("content", []):
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        print(part["text"])
+                    elif isinstance(part, str):
+                        print(part)
+        else:
+            print(full_prompt)
+        print("=" * 80)
+        lm_res = lm(full_prompt)
+        lm_out = lm_res.strip()
+        return cls.output_extractor(lm_out)
+
+    @classmethod
     def output_extractor(cls, lm_out: str) -> dict[str, str]:
         def extract_instruction_text() -> str:
             # Find the first and last backtick positions (if any)

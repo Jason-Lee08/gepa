@@ -86,6 +86,14 @@ class SingleComponentMultiModalProposer(dspy.Module):
         # Create a rich multimodal examples_with_feedback that includes both text and images
         predict_kwargs["examples_with_feedback"] = self._create_multimodal_examples(formatted_examples, image_map)
 
+        # Log the proposal prompt for debugging
+        logger.info("=" * 80)
+        logger.info("INSTRUCTION PROPOSAL PROMPT")
+        logger.info("=" * 80)
+        logger.info("Current instruction:\n%s", predict_kwargs["current_instruction"])
+        logger.info("Examples with feedback:\n%s", predict_kwargs["examples_with_feedback"])
+        logger.info("=" * 80)
+
         # Use current dspy LM settings (GEPA will pass reflection_lm via context)
         result = self.propose_instruction(**predict_kwargs)
 
