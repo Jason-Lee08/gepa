@@ -1418,6 +1418,7 @@ def optimize_anything(
         reflection_lm=config.reflection.reflection_lm,
         reflection_prompt_template=config.reflection.reflection_prompt_template,
         custom_candidate_proposer=config.reflection.custom_candidate_proposer,
+        callbacks=config.callbacks,
     )
 
     # Define evaluator function for merge proposer

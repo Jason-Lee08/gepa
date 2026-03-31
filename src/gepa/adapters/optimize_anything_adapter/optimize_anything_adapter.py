@@ -505,6 +505,24 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         """
         return json.dumps(all_attempts, indent=2, default=str)
 
+    # Keys that exist for downstream tracking/logging but should not be
+    # shown to the reflection LM.  They remain in the raw trajectories
+    # (side_infos) for Pareto tracking (read in evaluate()) and eval.py.
+    _REFLECTION_EXCLUDED_KEYS = frozenset({
+        "scores",                # All 6 metric variants — for Pareto tracking only
+        "coverage_score",        # Companion metric — for eval.py logging only
+        "quality_score",         # Mean quality — already summarized in Feedback string
+        "per_attempt_quality",   # Verbose per-item judge breakdowns — for eval.py only
+        "diversity_score",       # Mean diversity — for Pareto tracking only
+        "diversity_alpha",       # Diversity config — not useful for reflection
+        "diversity_mode",        # Diversity config — not useful for reflection
+        "eval_params",           # Model/config metadata — not useful for reflection
+        "quality_results",       # Full judge analyses — already summarized in Feedback
+        "judge_responses",       # Raw judge outputs — already summarized in Feedback
+        "num_valid_items",       # Diagnostic count — not useful for reflection
+        "num_parsed_items",      # Diagnostic count — not useful for reflection
+    })
+
     def make_reflective_dataset(
         self,
         candidate: dict[str, str],
@@ -515,8 +533,9 @@ class OptimizeAnythingAdapter(GEPAAdapter):
 
         For each component being updated, produces a list of dicts (one per
         example) combining shared SideInfo fields with any
-        ``<component>_specific_info`` data.  The ``"scores"`` key is renamed
-        to ``"Scores (Higher is Better)"`` for clarity in the LLM prompt.
+        ``<component>_specific_info`` data.  Tracking-only keys (see
+        ``_REFLECTION_EXCLUDED_KEYS``) are stripped so they don't appear
+        in the reflection prompt.
         """
         scores, side_infos = eval_batch.scores, eval_batch.trajectories
         assert side_infos is not None
@@ -526,8 +545,8 @@ class OptimizeAnythingAdapter(GEPAAdapter):
             for score, side_info in zip(scores, side_infos, strict=False):
                 ret[component_name].append({})
                 for k, v in side_info.items():
-                    if k == "scores":
-                        ret[component_name][-1]["Scores (Higher is Better)"] = v
+                    if k in self._REFLECTION_EXCLUDED_KEYS:
+                        continue
                     elif not k.endswith("_specific_info"):
                         ret[component_name][-1][k] = v
                     elif k == f"{component_name}_specific_info":
