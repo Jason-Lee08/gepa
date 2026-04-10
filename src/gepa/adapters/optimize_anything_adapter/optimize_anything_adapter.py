@@ -513,6 +513,7 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         "coverage_score",        # Companion metric — for eval.py logging only
         "quality_score",         # Mean quality — already summarized in Feedback string
         "per_attempt_quality",   # Verbose per-item judge breakdowns — for eval.py only
+        "per_sample_details",    # Geometric/RNG subsample logs — eval artifacts only, huge
         "diversity_score",       # Mean diversity — for Pareto tracking only
         "diversity_alpha",       # Diversity config — not useful for reflection
         "diversity_mode",        # Diversity config — not useful for reflection
