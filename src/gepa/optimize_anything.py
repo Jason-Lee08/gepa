@@ -123,6 +123,7 @@ from typing import (
 
 from gepa.adapters.optimize_anything_adapter.optimize_anything_adapter import OptimizeAnythingAdapter
 from gepa.core.adapter import DataInst, GEPAAdapter, ProposalFn
+from gepa.core.callbacks import GEPACallback
 from gepa.core.data_loader import ensure_loader
 from gepa.core.callbacks import GEPACallback
 from gepa.core.engine import GEPAEngine
@@ -130,15 +131,17 @@ from gepa.core.result import GEPAResult
 from gepa.core.state import EvaluationCache, FrontierType
 from gepa.image import Image  # noqa: F401 — re-exported for user convenience
 from gepa.logging.experiment_tracker import create_experiment_tracker
-from gepa.logging.logger import LoggerProtocol, StdOutLogger
+from gepa.logging.logger import Logger, LoggerProtocol, StdOutLogger
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.base import CandidateSelector, LanguageModel, ReflectionComponentSelector
 from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
+from gepa.strategies.acceptance import AcceptanceCriterion, ImprovementOrEqualAcceptance, StrictImprovementAcceptance
 from gepa.strategies.batch_sampler import BatchSampler, EpochShuffledBatchSampler
 from gepa.strategies.candidate_selector import (
     CurrentBestCandidateSelector,
     EpsilonGreedyCandidateSelector,
     ParetoCandidateSelector,
+    TopKParetoCandidateSelector,
 )
 from gepa.strategies.component_selector import (
     AllReflectionComponentSelector,
@@ -444,8 +447,9 @@ class Evaluator(Protocol):
 class EngineConfig:
     """Controls the optimization run loop: budget, parallelism, caching, and stopping.
 
-    Most users only need to set ``max_metric_calls`` (evaluation budget) and
-    optionally ``parallel``/``max_workers`` for concurrent evaluation.
+    Most users only need to set ``max_metric_calls`` (evaluation budget).
+    Parallel evaluation is enabled by default with ``max_workers`` set to
+    ``os.cpu_count() or 32`` (CPU count when available, otherwise 32).
 
     Set ``capture_stdio=True`` to automatically route any ``print()`` output
     inside your evaluator into ASI (under ``"stdout"``/``"stderr"`` keys),
@@ -458,7 +462,7 @@ class EngineConfig:
     display_progress_bar: bool = False
     raise_on_exception: bool = True
     use_cloudpickle: bool = True
-    track_best_outputs: bool = False
+    track_best_outputs: bool = True
 
     # Simple stopping conditions
     max_metric_calls: int | None = None
@@ -466,13 +470,30 @@ class EngineConfig:
 
     # Strategy selection for the engine
     val_evaluation_policy: EvaluationPolicy | Literal["full_eval"] = "full_eval"
-    candidate_selection_strategy: CandidateSelector | Literal["pareto", "current_best", "epsilon_greedy"] = "pareto"
+    candidate_selection_strategy: CandidateSelector | Literal[
+        "pareto", "current_best", "epsilon_greedy", "top_k_pareto"
+    ] = "pareto"
     frontier_type: FrontierType = "hybrid"
     frontier_objective_names: set[str] | None = None
 
+    # Acceptance criterion for reflective mutation proposals
+    acceptance_criterion: AcceptanceCriterion | Literal[
+        "strict_improvement", "improvement_or_equal"
+    ] = "strict_improvement"
+
     # Parallelization settings for evaluation
-    parallel: bool = False
-    max_workers: int | None = None
+    parallel: bool = True
+    max_workers: int | None = field(default_factory=lambda: os.cpu_count() or 32)
+
+    # Number of parallel proposal workers per optimization step.
+    # When > 1, multiple minibatches are sampled and proposed concurrently
+    # (each with its own evaluate-propose-evaluate pipeline), then acceptances
+    # are processed sequentially.
+    # Set to "auto" to compute from max_workers and minibatch_size:
+    #   auto = max(1, max_workers // minibatch_size)
+    # Each proposal evaluates minibatch_size examples at a time, so this
+    # fills the worker pool across concurrent proposals.
+    num_parallel_proposals: int | Literal["auto"] = 1
 
     # Evaluation caching
     cache_evaluation: bool = False
@@ -693,6 +714,32 @@ Provide the new parameter value within ``` blocks."""
 
 # --- Component 2: Proposer Configurations ---
 @dataclass
+class ComBEEConfig:
+    """Controls optional ComBEE aggregation for reflection updates.
+
+    ``use_combee`` enables ComBEE parallel scan aggregation
+    (`paper <https://arxiv.org/abs/2604.04247>`_). When enabled, the
+    reflection step applies augmented shuffling, splits the minibatch into
+    ``k = floor(sqrt(n))`` groups, runs one LM call per group (Map), and
+    aggregates the ``k`` intermediate instructions into one final update
+    (Reduce). This prevents context overload at large batch sizes.
+
+    ComBEE requires ``reflection_minibatch_size >= 4``; with the default of 3,
+    ``k=1`` and it silently falls back to standard GEPA.
+
+    ``duplication_factor`` is the augmented-shuffle duplication count ``p``.
+    The paper default is ``2``.
+
+    ``aggregation_prompt_template`` optionally overrides the Level-2 Reduce
+    prompt used to synthesize the intermediate proposals.
+    """
+
+    use_combee: bool = False
+    duplication_factor: int = 2
+    aggregation_prompt_template: str | None = None
+
+
+@dataclass
 class ReflectionConfig:
     """Controls how the LLM proposes improved candidates each iteration.
 
@@ -706,6 +753,10 @@ class ReflectionConfig:
     targeted improvements on that subset.  Over iterations, all examples get
     attention, and the Pareto frontier preserves specialized gains across
     iterations rather than averaging them away.
+
+    ``combee`` controls the optional ComBEE aggregation stage. ComBEE requires
+    ``reflection_minibatch_size >= 4``; with the default of 3, ``k=1`` and it
+    silently falls back to standard GEPA.
     """
 
     skip_perfect_score: bool = False
@@ -716,6 +767,7 @@ class ReflectionConfig:
     reflection_lm: LanguageModel | str | None = "openai/gpt-5.1"
     reflection_prompt_template: str | dict[str, str] | None = optimize_anything_reflection_prompt_template
     custom_candidate_proposer: ProposalFn | None = None
+    combee: ComBEEConfig = field(default_factory=ComBEEConfig)
 
 
 @dataclass
@@ -783,9 +835,73 @@ class TrackingConfig:
     use_wandb: bool = False
     wandb_api_key: str | None = None
     wandb_init_kwargs: dict[str, Any] | None = None
+    wandb_attach_existing: bool = False
+    """Attach to an already-active W&B run without managing its lifecycle.
+
+    When ``True``, GEPA logs metrics and tables into the run that is already
+    active in the process (``wandb.run``) — it will not call ``wandb.init()``
+    on entry or ``wandb.finish()`` on exit.
+    """
+    wandb_step_metric: str | None = None
+    """Custom x-axis metric name for wandb charts.
+
+    When set, GEPA uses ``wandb.define_metric`` to declare a custom x-axis
+    for all its metrics, decoupling them from wandb's global monotonic step
+    counter.  The ``step`` value passed to ``log_metrics`` is injected as a
+    regular metric (under this name) instead of being passed as ``step=``.
+
+    **Required when embedding GEPA inside a host training loop** that manages
+    its own wandb step counter.  Without this, GEPA's ``step=1, 2, 3, ...``
+    collides with the host's ``step=100, 101, ...``, causing wandb to drop
+    GEPA's data.
+
+    Example::
+
+        TrackingConfig(
+            use_wandb=True,
+            wandb_attach_existing=True,
+            wandb_step_metric="gepa/iteration",
+        )
+    """
     use_mlflow: bool = False
     mlflow_tracking_uri: str | None = None
     mlflow_experiment_name: str | None = None
+    mlflow_attach_existing: bool = False
+    """Attach to an already-active MLflow run without managing its lifecycle.
+
+    When ``True``, GEPA logs into the run that is already active (via
+    ``mlflow.active_run()``) — it will not call ``mlflow.start_run()`` on
+    entry or ``mlflow.end_run()`` on exit.
+
+    Use this when embedding GEPA inside a training loop that manages its own
+    MLflow run::
+
+        import mlflow
+        with mlflow.start_run():          # caller owns this run
+            result = optimize_anything(
+                ...,
+                config=GEPAConfig(
+                    tracking=TrackingConfig(
+                        use_mlflow=True,
+                        mlflow_attach_existing=True,
+                    )
+                ),
+            )
+            mlflow.log_metric("train/loss", 0.1)  # still works
+    """
+    key_prefix: str = ""
+    """String prepended to every key/name logged to wandb and MLflow.
+
+    Applies uniformly to metric keys, config keys, summary keys, table names,
+    and HTML artifact keys.  Useful when running multiple GEPA optimizations in
+    the same wandb/MLflow run to keep their data namespaced::
+
+        TrackingConfig(
+            use_wandb=True,
+            wandb_attach_existing=True,
+            key_prefix="gepa/round2/",   # metrics become e.g. gepa/round2/val_score
+        )
+    """
 
 
 @dataclass
@@ -799,7 +915,7 @@ class GEPAConfig:
     Example::
 
         config = GEPAConfig(
-            engine=EngineConfig(max_metric_calls=200, parallel=True, max_workers=16),
+            engine=EngineConfig(max_metric_calls=200),
             reflection=ReflectionConfig(reflection_lm="openai/gpt-5.1"),
             refiner=RefinerConfig(max_refinements=2),
         )
@@ -816,7 +932,24 @@ class GEPAConfig:
 
     # Complex callbacks that aren't serializable
     stop_callbacks: StopperProtocol | Sequence[StopperProtocol] | None = None
-    callbacks: list[GEPACallback] | None = None
+    callbacks: "list[GEPACallback] | None" = None
+    """Observation callbacks for monitoring optimization progress.
+
+    Receive events like ``on_optimization_start``, ``on_iteration_end``,
+    ``on_candidate_accepted``, ``on_proposal_end``, etc.  See
+    :class:`~gepa.core.callbacks.GEPACallback` for the full protocol.
+
+    Example::
+
+        class MyCallback:
+            def on_candidate_accepted(self, event):
+                print(f"New candidate {event['new_candidate_idx']} accepted")
+
+        config = GEPAConfig(
+            callbacks=[MyCallback()],
+            engine=EngineConfig(max_metric_calls=100),
+        )
+    """
 
     def __post_init__(self):
         """Handle dicts passed in (e.g., from a JSON/YAML file)."""
@@ -847,18 +980,14 @@ def make_litellm_lm(model_name: str) -> LanguageModel:
     The returned callable conforms to the ``LanguageModel`` protocol and
     accepts a plain ``str`` prompt, a ``list[dict]`` chat-messages list, or
     a multimodal messages list (with content arrays containing images).
+
+    Uses :class:`gepa.lm.LM` which handles reasoning model detection
+    (o1/o3/o4/gpt-5), retries with exponential backoff, truncation
+    warnings, and ``drop_params=True`` for cross-model compatibility.
     """
-    import litellm
+    from gepa.lm import LM
 
-    def _lm(prompt: str | list[dict[str, Any]]) -> str:
-        if isinstance(prompt, str):
-            messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        else:
-            messages = prompt
-        completion = litellm.completion(model=model_name, messages=messages)
-        return completion.choices[0].message.content  # type: ignore[union-attr]
-
-    return _lm
+    return LM(model_name)
 
 
 class EvaluatorWrapper:
@@ -996,6 +1125,17 @@ class EvaluatorWrapper:
         self, candidate: Candidate, example: object | None = None, **kwargs: Any
     ) -> tuple[float, Any, SideInfo]:
         return self._wrapped(candidate, example=example, **kwargs)
+
+
+def _resolve_num_parallel_proposals(
+    value: int | Literal["auto"],
+    max_workers: int,
+    minibatch_size: int,
+) -> int:
+    """Resolve num_parallel_proposals, computing automatically if "auto"."""
+    if isinstance(value, int):
+        return value
+    return max(1, max_workers // minibatch_size)
 
 
 def optimize_anything(
@@ -1293,7 +1433,11 @@ def optimize_anything(
 
     # Setup default logger if not provided
     if config.tracking.logger is None:
-        config.tracking.logger = StdOutLogger()
+        if config.engine.run_dir is not None:
+            os.makedirs(config.engine.run_dir, exist_ok=True)
+            config.tracking.logger = Logger(os.path.join(config.engine.run_dir, "run_log.txt"))
+        else:
+            config.tracking.logger = StdOutLogger()
 
     # --- 3. Setup random number generator ---
     rng = random.Random(config.engine.seed)
@@ -1305,6 +1449,7 @@ def optimize_anything(
             "pareto": lambda: ParetoCandidateSelector(rng=rng),
             "current_best": lambda: CurrentBestCandidateSelector(),
             "epsilon_greedy": lambda: EpsilonGreedyCandidateSelector(epsilon=0.1, rng=rng),
+            "top_k_pareto": lambda: TopKParetoCandidateSelector(k=5, rng=rng),
         }
 
         try:
@@ -1312,7 +1457,7 @@ def optimize_anything(
         except KeyError as exc:
             raise ValueError(
                 f"Unknown candidate_selector strategy: {config.engine.candidate_selection_strategy}. "
-                "Supported strategies: 'pareto', 'current_best', 'epsilon_greedy'"
+                "Supported strategies: 'pareto', 'current_best', 'epsilon_greedy', 'top_k_pareto'"
             ) from exc
     elif isinstance(config.engine.candidate_selection_strategy, CandidateSelector):
         candidate_selector = config.engine.candidate_selection_strategy
@@ -1327,6 +1472,27 @@ def optimize_anything(
     elif not isinstance(config.engine.val_evaluation_policy, EvaluationPolicy):
         raise ValueError(
             f"val_evaluation_policy should be 'full_eval' or an EvaluationPolicy instance, but got {type(config.engine.val_evaluation_policy)}"
+        )
+
+    # --- 5b. Build acceptance criterion from EngineConfig ---
+    acceptance_criterion_instance: AcceptanceCriterion
+    if isinstance(config.engine.acceptance_criterion, str):
+        acceptance_factories: dict[str, type[AcceptanceCriterion]] = {
+            "strict_improvement": StrictImprovementAcceptance,
+            "improvement_or_equal": ImprovementOrEqualAcceptance,
+        }
+        try:
+            acceptance_criterion_instance = acceptance_factories[config.engine.acceptance_criterion]()
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown acceptance_criterion: {config.engine.acceptance_criterion}. "
+                "Supported strategies: 'strict_improvement', 'improvement_or_equal'"
+            ) from exc
+    elif isinstance(config.engine.acceptance_criterion, AcceptanceCriterion):
+        acceptance_criterion_instance = config.engine.acceptance_criterion
+    else:
+        raise TypeError(
+            "acceptance_criterion must be a supported string strategy or an instance of AcceptanceCriterion."
         )
 
     # --- 6. Build module selector from ReflectionConfig ---
@@ -1356,9 +1522,13 @@ def optimize_anything(
         use_wandb=config.tracking.use_wandb,
         wandb_api_key=config.tracking.wandb_api_key,
         wandb_init_kwargs=config.tracking.wandb_init_kwargs,
+        wandb_attach_existing=config.tracking.wandb_attach_existing,
+        wandb_step_metric=config.tracking.wandb_step_metric,
         use_mlflow=config.tracking.use_mlflow,
         mlflow_tracking_uri=config.tracking.mlflow_tracking_uri,
         mlflow_experiment_name=config.tracking.mlflow_experiment_name,
+        mlflow_attach_existing=config.tracking.mlflow_attach_existing,
+        key_prefix=config.tracking.key_prefix,
     )
 
     # --- 9. Build reflection prompt template from objective/background if provided ---
@@ -1419,6 +1589,10 @@ def optimize_anything(
         reflection_lm=config.reflection.reflection_lm,
         reflection_prompt_template=config.reflection.reflection_prompt_template,
         custom_candidate_proposer=config.reflection.custom_candidate_proposer,
+        use_combee=config.reflection.combee.use_combee,
+        combee_duplication_factor=config.reflection.combee.duplication_factor,
+        combee_aggregation_prompt=config.reflection.combee.aggregation_prompt_template,
+        rng=rng,
         callbacks=config.callbacks,
     )
 
@@ -1467,13 +1641,24 @@ def optimize_anything(
         raise_on_exception=config.engine.raise_on_exception,
         stop_callback=stop_callback,
         val_evaluation_policy=config.engine.val_evaluation_policy,
+        acceptance_criterion=acceptance_criterion_instance,
         use_cloudpickle=config.engine.use_cloudpickle,
         evaluation_cache=evaluation_cache,
+        num_parallel_proposals=_resolve_num_parallel_proposals(
+            config.engine.num_parallel_proposals,
+            config.engine.max_workers or (os.cpu_count() or 32),
+            config.reflection.reflection_minibatch_size or 1,
+        ),
     )
 
     # --- 15. Run optimization ---
+    logger = config.tracking.logger
     with experiment_tracker:
-        state = engine.run()
+        if isinstance(logger, Logger):
+            with logger:
+                state = engine.run()
+        else:
+            state = engine.run()
 
     return GEPAResult.from_state(
         state,

@@ -50,7 +50,8 @@ For more tutorials, especially those focused on the DSPy integration, see:
 - [DeepResearch Agent](https://www.rajapatnaik.com/blog/2025/10/23/langgraph-dspy-gepa-researcher) - LangGraph + DSPy + GEPA research system by @RajaPatnaik
 - [Self-Improving AI Agents](https://medium.com/@bindupriya117/building-self-improving-ai-agents-gepa-for-orchestration-trm-for-reasoning-1602e96f3e2b) - GEPA for orchestration, TRM for reasoning
 - [Context Compression Experiments](https://github.com/Laurian/context-compression-experiments-2508) - GEPA for optimizing context compression prompts by @gridinoc
-- [Google ADK Training with GEPA](https://raphaelmansuy.github.io/adk_training/blog/gepa-optimization-tutorial/) - Optimizing Google Agent Development Kit agents
+- [Google ADK Agent Optimization (Official)](https://adk.dev/optimize/) - Built-in GEPA-powered optimization in Google's Agent Development Kit
+- [Google ADK Training with GEPA](https://raphaelmansuy.github.io/adk_training/blog/gepa-optimization-tutorial/) - Community tutorial on optimizing ADK agents
 - [Speeding Up a Sudoku Solver with GEPA optimize_anything](https://blog.mariusvach.com/posts/gepa-sudoku-solver) - Use `optimize_anything` to speed up a Python Sudoku solver `optimize_anything`
 
 ### International Tutorials
@@ -58,6 +59,7 @@ For more tutorials, especially those focused on the DSPy integration, see:
 - [GEPA Explained (Japanese Video)](https://youtu.be/P5mW0IbotlY) - AIが反省し始めた？内省的学習法のGEPAの仕組み
 - [MLflow + GEPA on Databricks Free Edition (Japanese)](https://qiita.com/isanakamishiro2/items/f15c4c4c79bd22222ccf) - Qiita tutorial
 - [Naruto-Style Dialogues with GEPA (Japanese)](https://zenn.dev/cybernetics/articles/39fb763aca746c) - Creative application
+- [GMO: GEPA Prompt Optimizer (Japanese)](https://recruit.group.gmo/engineer/jisedai/blog/gepa-prompt-optimizer/) - DSPy ReAct agent tutorial by GMO Internet Group AI Lab
 - [GEPA Revolutionary Breakthrough (Chinese)](https://jieyibu.net/a/65905) - 35x efficiency improvement explained
 - [DSPy + GEPA Tutorial (HuggingFace Cookbook)](https://huggingface.co/learn/cookbook/en/dspy_gepa) - Featured by @TheDojoMX
 

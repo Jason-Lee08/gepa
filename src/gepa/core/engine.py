@@ -1,9 +1,11 @@
 # Copyright (c) 2025 Lakshya A Agrawal and the GEPA contributors
 # https://github.com/gepa-ai/gepa
 
+import os
 import traceback
 from collections.abc import Sequence
-from typing import Generic
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Generic
 
 from gepa.core.adapter import DataInst, GEPAAdapter, RolloutOutput, Trajectory
 from gepa.core.callbacks import (
@@ -29,10 +31,13 @@ from gepa.core.state import EvaluationCache, FrontierType, GEPAState, ValsetEval
 from gepa.logging.experiment_tracker import ExperimentTracker
 from gepa.logging.logger import LoggerProtocol
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
+from gepa.proposer.base import CandidateProposal
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.reflective_mutation import (
+    ProposalOutput,
     ReflectiveMutationProposer,
 )
+from gepa.strategies.acceptance import AcceptanceCriterion, ImprovementOrEqualAcceptance, StrictImprovementAcceptance
 from gepa.strategies.eval_policy import EvaluationPolicy, FullEvaluationPolicy
 from gepa.utils import StopperProtocol
 
@@ -74,8 +79,12 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         # Budget and Stop Condition
         stop_callback: StopperProtocol | None = None,
         val_evaluation_policy: EvaluationPolicy[DataId, DataInst] | None = None,
+        # Acceptance criterion for reflective mutation proposals
+        acceptance_criterion: AcceptanceCriterion | None = None,
         # Evaluation caching (stored in state, passed here for initialization)
         evaluation_cache: EvaluationCache[RolloutOutput, DataId] | None = None,
+        # Parallel proposals
+        num_parallel_proposals: int = 1,
     ):
         self.logger = logger
         self.run_dir = run_dir
@@ -115,14 +124,35 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         if self.merge_proposer is not None:
             self.merge_proposer.last_iter_found_new_program = False
 
+        self.acceptance_criterion: AcceptanceCriterion = acceptance_criterion or StrictImprovementAcceptance()
         self.track_best_outputs = track_best_outputs
         self.display_progress_bar = display_progress_bar
         self.use_cloudpickle = use_cloudpickle
 
+        self.num_parallel_proposals = num_parallel_proposals
         self.raise_on_exception = raise_on_exception
         self.val_evaluation_policy: EvaluationPolicy[DataId, DataInst] = (
             val_evaluation_policy if val_evaluation_policy is not None else FullEvaluationPolicy()
         )
+
+    def _sync_adapter_state_to_state(self, state: GEPAState) -> None:
+        """Snapshot adapter state into GEPAState before saving.
+
+        No-op if the adapter does not implement ``get_adapter_state``.
+        Makes a shallow copy to avoid mutations between snapshot and save.
+        """
+        getter = getattr(self.adapter, "get_adapter_state", None)
+        if getter is not None:
+            state.adapter_state = dict(getter())
+
+    def _sync_state_to_adapter(self, state: GEPAState) -> None:
+        """Restore persisted adapter state into the adapter after loading.
+
+        No-op if the adapter does not implement ``set_adapter_state``.
+        """
+        setter = getattr(self.adapter, "set_adapter_state", None)
+        if setter is not None:
+            setter(state.adapter_state)
 
     def _evaluate_on_valset(
         self,
@@ -249,7 +279,219 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             valset_size=len(valset),
             val_evaluation_policy=self.val_evaluation_policy,
         )
+
+        # Log candidate table row with instructions and metadata
+        component_names = sorted(new_program.keys())
+        columns = ["iteration", "candidate_idx", "parent_ids", "valset_score", "is_best"] + [
+            f"text:{name}" for name in component_names
+        ]
+        row = [
+            state.i + 1,
+            new_program_idx,
+            str(parent_program_idx),
+            valset_score,
+            is_best_program,
+        ] + [new_program[name] for name in component_names]
+        self.experiment_tracker.log_table("candidates", columns=columns, data=[row])
+
+        # Update candidate tree visualization
+        self._log_candidate_tree(state)
+
         return new_program_idx, linear_pareto_front_program_idx
+
+    # ------------------------------------------------------------------
+    # Reflective proposal acceptance (shared by single and parallel paths)
+    # ------------------------------------------------------------------
+
+    def _accept_reflective_proposal(
+        self,
+        proposal: CandidateProposal,
+        iteration: int,
+        state: GEPAState[RolloutOutput, DataId],
+    ) -> bool:
+        """Check acceptance, run full eval if accepted, fire callbacks.
+
+        Returns True if the proposal was accepted.
+        """
+        old_sum = sum(proposal.subsample_scores_before or [])
+        new_sum = sum(proposal.subsample_scores_after or [])
+        _uses_builtin_criterion = isinstance(
+            self.acceptance_criterion, StrictImprovementAcceptance | ImprovementOrEqualAcceptance
+        )
+
+        primary_accepted = self.acceptance_criterion.should_accept(proposal, state)
+
+        # Multi-metric: if primary criterion rejected but a frontier objective improved, accept anyway
+        frontier_accept_reason: str | None = None
+        if not primary_accepted and self.frontier_objective_names:
+            eval_before = proposal.eval_before
+            eval_after = proposal.eval_after
+            before_obj = eval_before.objective_scores if eval_before else None
+            after_obj = eval_after.objective_scores if eval_after else None
+            if before_obj and after_obj:
+                for obj_name in self.frontier_objective_names:
+                    old_obj_sum = sum(d.get(obj_name, 0.0) for d in before_obj)
+                    new_obj_sum = sum(d.get(obj_name, 0.0) for d in after_obj)
+                    if new_obj_sum > old_obj_sum:
+                        frontier_accept_reason = f"objective '{obj_name}': {new_obj_sum:.4f} > {old_obj_sum:.4f}"
+                        break
+
+        if not primary_accepted and frontier_accept_reason is None:
+            if _uses_builtin_criterion:
+                reject_msg = f"Iteration {iteration}: New subsample score {new_sum} is not better than old score {old_sum}, skipping"
+                reject_reason = f"New subsample score {new_sum} not better than old score {old_sum}"
+            else:
+                reject_msg = f"Iteration {iteration}: Candidate rejected by acceptance criterion (old_sum={old_sum}, new_sum={new_sum}), skipping"
+                reject_reason = f"Candidate rejected by acceptance criterion (old_sum={old_sum}, new_sum={new_sum})"
+            self.logger.log(reject_msg)
+            self._log_proposal_lm_calls(iteration, proposal, candidate_idx=-1)
+            notify_callbacks(
+                self.callbacks,
+                "on_candidate_rejected",
+                CandidateRejectedEvent(
+                    iteration=iteration,
+                    old_score=old_sum,
+                    new_score=new_sum,
+                    reason=reject_reason,
+                ),
+            )
+            return False
+
+        if frontier_accept_reason is not None:
+            accept_msg = f"Iteration {iteration}: Candidate accepted via frontier objective ({frontier_accept_reason}). Continue to full eval and add to candidate pool."
+        elif _uses_builtin_criterion:
+            accept_msg = f"Iteration {iteration}: New subsample score {new_sum} is better than old score {old_sum}. Continue to full eval and add to candidate pool."
+        else:
+            accept_msg = f"Iteration {iteration}: Candidate accepted (old_sum={old_sum}, new_sum={new_sum}). Continue to full eval and add to candidate pool."
+        self.logger.log(accept_msg)
+
+        new_idx, _ = self._run_full_eval_and_add(
+            new_program=proposal.candidate,
+            state=state,
+            parent_program_idx=proposal.parent_program_ids,
+        )
+
+        self._log_proposal_lm_calls(iteration, proposal, candidate_idx=new_idx)
+
+        notify_callbacks(
+            self.callbacks,
+            "on_candidate_accepted",
+            CandidateAcceptedEvent(
+                iteration=iteration,
+                new_candidate_idx=new_idx,
+                new_score=new_sum,
+                parent_ids=proposal.parent_program_ids,
+            ),
+        )
+        return True
+
+    def _process_proposal_output(
+        self,
+        output: ProposalOutput,
+        iteration: int,
+        trace_entry: dict,
+        state: GEPAState[RolloutOutput, DataId],
+    ) -> bool:
+        """Apply deferred state updates from a ProposalOutput and run acceptance.
+
+        Returns True if the proposal was accepted.
+        """
+        self.reflective_proposer.apply_proposal_output(output, state)
+        trace_entry.update(output.trace_data)
+
+        if output.proposal is None:
+            self.logger.log(f"Iteration {iteration}: Reflective mutation did not propose a new candidate")
+            return False
+
+        accepted = self._accept_reflective_proposal(output.proposal, iteration, state)
+
+        if accepted and self.merge_proposer is not None:
+            self.merge_proposer.last_iter_found_new_program = True
+            if self.merge_proposer.total_merges_tested < self.merge_proposer.max_merge_invocations:
+                self.merge_proposer.merges_due += 1
+
+        return accepted
+
+    # ------------------------------------------------------------------
+    # Parallel reflective proposals
+    # ------------------------------------------------------------------
+
+    def _run_parallel_reflective_batch(
+        self,
+        state: GEPAState[RolloutOutput, DataId],
+    ) -> bool:
+        """Run multiple reflective proposals in parallel.
+
+        Pre-samples N contexts sequentially, executes the heavy
+        evaluate-propose-evaluate pipeline in parallel threads, then
+        processes acceptances sequentially.
+        """
+        n = self.num_parallel_proposals
+
+        # Step 1: Pre-sample N contexts (sequential)
+        contexts = []
+        trace_entries: list[dict] = []
+
+        # First context uses the iteration slot already created by the caller
+        trace_entry_0 = state.full_program_trace[-1]
+        ctx_0 = self.reflective_proposer.prepare_proposal(state)
+        trace_entry_0["selected_program_candidate"] = ctx_0.curr_prog_id
+        trace_entry_0["subsample_ids"] = ctx_0.subsample_ids
+        contexts.append(ctx_0)
+        trace_entries.append(trace_entry_0)
+
+        for _ in range(n - 1):
+            if self._should_stop(state):
+                break
+            state.i += 1
+            trace_entry: dict[str, Any] = {"i": state.i}
+            state.full_program_trace.append(trace_entry)
+            ctx = self.reflective_proposer.prepare_proposal(state)
+            trace_entry["selected_program_candidate"] = ctx.curr_prog_id
+            trace_entry["subsample_ids"] = ctx.subsample_ids
+            contexts.append(ctx)
+            trace_entries.append(trace_entry)
+
+        if not contexts:
+            return False
+
+        # Step 2: Execute proposals in parallel (thread-safe heavy compute)
+        outputs: list[ProposalOutput | None] = [None] * len(contexts)
+        with ThreadPoolExecutor(max_workers=len(contexts)) as executor:
+            future_to_idx = {
+                executor.submit(self.reflective_proposer.execute_proposal, ctx, state): idx
+                for idx, ctx in enumerate(contexts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    outputs[idx] = future.result()
+                except Exception as e:
+                    self.logger.log(f"Iteration {contexts[idx].iteration}: Parallel proposal failed: {e}")
+                    self.logger.log(traceback.format_exc())
+                    notify_callbacks(
+                        self.callbacks,
+                        "on_error",
+                        ErrorEvent(
+                            iteration=contexts[idx].iteration,
+                            exception=e,
+                            will_continue=True,
+                        ),
+                    )
+
+        # Step 3: Process acceptances sequentially
+        any_accepted = False
+        for _idx, (ctx, trace_entry, output) in enumerate(zip(contexts, trace_entries, outputs, strict=False)):
+            if output is None:
+                continue
+            if self._process_proposal_output(output, ctx.iteration, trace_entry, state):
+                any_accepted = True
+
+        return any_accepted
+
+    # ------------------------------------------------------------------
+    # Main optimization loop
+    # ------------------------------------------------------------------
 
     def run(self) -> GEPAState[RolloutOutput, DataId]:
         # Check tqdm availability if progress bar is enabled
@@ -303,25 +545,74 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                 objective_scores_by_val_id=objective_scores_dict,
             )
 
-        # Initialize state
+        # Notify callbacks of optimization start (before seed valset eval)
+        notify_callbacks(
+            self.callbacks,
+            "on_optimization_start",
+            OptimizationStartEvent(
+                seed_candidate=self.seed_candidate,
+                trainset_size=len(self.reflective_proposer.trainset),
+                valset_size=len(valset),
+                config={
+                    "perfect_score": self.perfect_score,
+                    "seed": self.seed,
+                    "track_best_outputs": self.track_best_outputs,
+                },
+            ),
+        )
+
+        # Evaluate seed candidate on valset (after on_optimization_start callback)
+        seed_valset_evaluation = valset_evaluator(self.seed_candidate)
+
+        # Initialize state with pre-computed seed evaluation
         state = initialize_gepa_state(
             run_dir=self.run_dir,
             logger=self.logger,
             seed_candidate=self.seed_candidate,
-            valset_evaluator=valset_evaluator,
+            seed_valset_evaluation=seed_valset_evaluation,
             track_best_outputs=self.track_best_outputs,
             frontier_type=self.frontier_type,
             evaluation_cache=self._initial_evaluation_cache,
         )
 
+        # Restore adapter state from persisted state (only has effect on resume)
+        self._sync_state_to_adapter(state)
+
         # Log base program score
+        # Log run configuration
+        self.experiment_tracker.log_config(
+            {
+                "seed": self.seed,
+                "perfect_score": self.perfect_score,
+                "frontier_type": self.frontier_type,
+                "track_best_outputs": self.track_best_outputs,
+                "use_cloudpickle": self.use_cloudpickle,
+                "raise_on_exception": self.raise_on_exception,
+                "trainset_size": len(self.reflective_proposer.trainset),
+                "valset_size": len(valset),
+                "seed_candidate_components": sorted(self.seed_candidate.keys()),
+                "val_evaluation_policy": type(self.val_evaluation_policy).__name__,
+                "has_merge_proposer": self.merge_proposer is not None,
+                "run_dir": self.run_dir,
+            }
+        )
+
+        # Log base program score using the same metric names as subsequent iterations
+        # so they appear on the same charts in wandb/mlflow
         base_val_avg, base_val_coverage = state.get_program_average_val_subset(0)
+        pareto_scores = list(state.pareto_front_valset.values())
+        base_pareto_avg = sum(pareto_scores) / len(pareto_scores) if pareto_scores else base_val_avg
         self.experiment_tracker.log_metrics(
             {
-                "base_program_full_valset_score": base_val_avg,
-                "base_program_val_coverage": base_val_coverage,
-                "iteration": state.i + 1,
+                "val_program_average": base_val_avg,
+                "best_score_on_valset": base_val_avg,
+                "val_evaluated_count_new_program": base_val_coverage,
+                "val_total_count": len(valset),
                 "total_metric_calls": state.total_num_evals,
+                "valset_pareto_front_agg": base_pareto_avg,
+                "new_program_idx": 0,
+                "linear_pareto_front_program_idx": 0,
+                "best_program_as_per_agg_score_valset": 0,
             },
             step=state.i + 1,
         )
@@ -347,22 +638,6 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     f"Frontier objectives: {sorted(self.frontier_objective_names)}. "
                     f"(No objective scores from base eval — objectives will appear after first accepted candidate)"
                 )
-
-        # Notify callbacks of optimization start
-        notify_callbacks(
-            self.callbacks,
-            "on_optimization_start",
-            OptimizationStartEvent(
-                seed_candidate=self.seed_candidate,
-                trainset_size=len(self.reflective_proposer.trainset),
-                valset_size=len(valset),
-                config={
-                    "perfect_score": self.perfect_score,
-                    "seed": self.seed,
-                    "track_best_outputs": self.track_best_outputs,
-                },
-            ),
-        )
 
         # Notify callbacks of seed candidate's initial valset evaluation (iteration 0)
         # This provides the baseline performance before any optimization
@@ -415,6 +690,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             proposal_accepted = False
             iteration_started = False
             try:
+                self._sync_adapter_state_to_state(state)
                 state.save(self.run_dir, use_cloudpickle=self.use_cloudpickle)
                 notify_callbacks(
                     self.callbacks,
@@ -435,6 +711,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     IterationStartEvent(
                         iteration=state.i + 1,
                         state=state,
+                        trainset_loader=self.reflective_proposer.trainset,
                     ),
                 )
                 iteration_started = True
@@ -469,15 +746,17 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                             if (
                                 not merge_accepted
                                 and self.frontier_objective_names
-                                and proposal.subsample_objective_scores_before
-                                and proposal.subsample_objective_scores_after
+                                and proposal.eval_before is not None
+                                and proposal.eval_after is not None
+                                and proposal.eval_before.objective_scores
+                                and proposal.eval_after.objective_scores
                             ):
                                 for obj_name in self.frontier_objective_names:
                                     parent_obj_avgs = [
                                         d.get(obj_name, float("-inf"))
-                                        for d in proposal.subsample_objective_scores_before
+                                        for d in proposal.eval_before.objective_scores
                                     ]
-                                    new_obj_avg = proposal.subsample_objective_scores_after[0].get(
+                                    new_obj_avg = proposal.eval_after.objective_scores[0].get(
                                         obj_name, float("-inf")
                                     )
                                     if new_obj_avg >= max(parent_obj_avgs):
@@ -540,83 +819,13 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     self.merge_proposer.last_iter_found_new_program = False
 
                 # 2) Reflective mutation proposer
-                proposal = self.reflective_proposer.propose(state)
-                if proposal is None:
-                    self.logger.log(f"Iteration {state.i + 1}: Reflective mutation did not propose a new candidate")
-                    continue
-
-                # Acceptance: require strict improvement on subsample (primary or any frontier objective)
-                old_sum = sum(proposal.subsample_scores_before or [])
-                new_sum = sum(proposal.subsample_scores_after or [])
-
-                accepted = new_sum > old_sum
-                accepted_reason = f"primary score: {new_sum} > {old_sum}" if accepted else ""
-
-                # Multi-metric: check frontier objectives if primary didn't accept
-                if (
-                    not accepted
-                    and self.frontier_objective_names
-                    and proposal.subsample_objective_scores_before
-                    and proposal.subsample_objective_scores_after
-                ):
-                    for obj_name in self.frontier_objective_names:
-                        old_obj_sum = sum(
-                            d.get(obj_name, 0.0) for d in proposal.subsample_objective_scores_before
-                        )
-                        new_obj_sum = sum(
-                            d.get(obj_name, 0.0) for d in proposal.subsample_objective_scores_after
-                        )
-                        if new_obj_sum > old_obj_sum:
-                            accepted = True
-                            accepted_reason = f"objective '{obj_name}': {new_obj_sum} > {old_obj_sum}"
-                            break
-
-                if not accepted:
-                    self.logger.log(
-                        f"Iteration {state.i + 1}: New subsample score {new_sum} is not better than old score {old_sum}, skipping"
-                    )
-                    # Notify candidate rejected
-                    notify_callbacks(
-                        self.callbacks,
-                        "on_candidate_rejected",
-                        CandidateRejectedEvent(
-                            iteration=state.i + 1,
-                            old_score=old_sum,
-                            new_score=new_sum,
-                            reason=f"New subsample score {new_sum} not better than old score {old_sum}",
-                        ),
-                    )
-                    continue
+                if self.num_parallel_proposals > 1:
+                    proposal_accepted = self._run_parallel_reflective_batch(state)
                 else:
-                    self.logger.log(
-                        f"Iteration {state.i + 1}: Candidate accepted ({accepted_reason}). Continue to full eval and add to candidate pool."
+                    output = self.reflective_proposer.propose_output(state)
+                    proposal_accepted = self._process_proposal_output(
+                        output, state.i + 1, state.full_program_trace[-1], state
                     )
-
-                # Accept: full eval + add
-                new_idx, _ = self._run_full_eval_and_add(
-                    new_program=proposal.candidate,
-                    state=state,
-                    parent_program_idx=proposal.parent_program_ids,
-                )
-                proposal_accepted = True
-
-                # Notify candidate accepted
-                notify_callbacks(
-                    self.callbacks,
-                    "on_candidate_accepted",
-                    CandidateAcceptedEvent(
-                        iteration=state.i + 1,
-                        new_candidate_idx=new_idx,
-                        new_score=new_sum,
-                        parent_ids=proposal.parent_program_ids,
-                    ),
-                )
-
-                # Schedule merge attempts like original behavior
-                if self.merge_proposer is not None:
-                    self.merge_proposer.last_iter_found_new_program = True
-                    if self.merge_proposer.total_merges_tested < self.merge_proposer.max_merge_invocations:
-                        self.merge_proposer.merges_due += 1
 
             except Exception as e:
                 self.logger.log(f"Iteration {state.i + 1}: Exception during optimization: {e}")
@@ -653,6 +862,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         if self.display_progress_bar and progress_bar is not None:
             progress_bar.close()
 
+        self._sync_adapter_state_to_state(state)
         state.save(self.run_dir, use_cloudpickle=self.use_cloudpickle)
 
         # Log final summary
@@ -689,7 +899,97 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             ),
         )
 
+        # Log final summary: seed candidate, best candidate, and all candidates table
+        best_candidate = state.program_candidates[best_candidate_idx]
+        best_score = self.val_evaluation_policy.get_valset_score(best_candidate_idx, state)
+        summary: dict[str, Any] = {
+            "best_candidate_idx": best_candidate_idx,
+            "best_valset_score": best_score,
+            "total_iterations": state.i,
+            "total_candidates": len(state.program_candidates),
+        }
+        for name in sorted(self.seed_candidate.keys()):
+            summary[f"seed/{name}"] = self.seed_candidate[name]
+            summary[f"best/{name}"] = best_candidate[name]
+        self.experiment_tracker.log_summary(summary)
+
         return state
+
+    def _log_proposal_lm_calls(
+        self,
+        iteration: int,
+        proposal: Any,
+        candidate_idx: int,
+    ) -> None:
+        """Log per-component LM prompt / raw-output from a proposal to the experiment tracker.
+
+        Appends one row per component to the ``"proposals"`` table.
+        ``candidate_idx`` is the assigned index for accepted proposals,
+        or ``-1`` for rejected ones — making it easy to join with the
+        ``"candidates"`` table in WandB / MLflow.
+        """
+        metadata = proposal.metadata or {}
+        components = {
+            k.split(":", 1)[1]
+            for k in metadata
+            if k.startswith("prompt:") or k.startswith("raw_lm_output:")
+        }
+        if not components:
+            return
+
+        status = "accepted" if candidate_idx >= 0 else "rejected"
+        subsample_before = sum(proposal.subsample_scores_before or [])
+        subsample_after = sum(proposal.subsample_scores_after or [])
+        parent_ids_str = str(proposal.parent_program_ids)
+
+        rows = []
+        for comp in sorted(components):
+            prompt = metadata.get(f"prompt:{comp}", "")
+            raw_output = metadata.get(f"raw_lm_output:{comp}", "")
+            proposed_text = proposal.candidate.get(comp, "")
+            rows.append([
+                iteration,
+                comp,
+                status,
+                candidate_idx,
+                parent_ids_str,
+                subsample_before,
+                subsample_after,
+                prompt if isinstance(prompt, str) else str(prompt),
+                raw_output,
+                proposed_text,
+            ])
+
+        self.experiment_tracker.log_table(
+            "proposals",
+            columns=[
+                "iteration",
+                "component",
+                "status",
+                "candidate_idx",
+                "parent_ids",
+                "subsample_score_before",
+                "subsample_score_after",
+                "prompt",
+                "raw_lm_output",
+                "proposed_text",
+            ],
+            data=rows,
+        )
+
+    def _log_candidate_tree(self, state: GEPAState[RolloutOutput, DataId]) -> None:
+        """Generate and log the candidate tree visualization."""
+        try:
+            from gepa.visualization import candidate_tree_html
+
+            html_content = candidate_tree_html(state)
+            self.experiment_tracker.log_html(html_content, key="candidate_tree")
+            if self.run_dir is not None:
+                tree_path = os.path.join(self.run_dir, "candidate_tree.html")
+                with open(tree_path, "w") as f:
+                    f.write(html_content)
+        except Exception as e:
+            self.logger.log(f"Warning: Failed to generate candidate tree visualization: {e}")
 
     def _should_stop(self, state: GEPAState[RolloutOutput, DataId]) -> bool:
         """Check if the optimization should stop."""

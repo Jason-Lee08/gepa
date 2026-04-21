@@ -20,15 +20,17 @@ from gepa.core.engine import GEPAEngine
 from gepa.core.result import GEPAResult
 from gepa.core.state import EvaluationCache, FrontierType
 from gepa.logging.experiment_tracker import create_experiment_tracker
-from gepa.logging.logger import LoggerProtocol, StdOutLogger
+from gepa.logging.logger import Logger, LoggerProtocol, StdOutLogger
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.base import CandidateSelector, LanguageModel, ReflectionComponentSelector
 from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
+from gepa.strategies.acceptance import AcceptanceCriterion, ImprovementOrEqualAcceptance, StrictImprovementAcceptance
 from gepa.strategies.batch_sampler import BatchSampler, EpochShuffledBatchSampler
 from gepa.strategies.candidate_selector import (
     CurrentBestCandidateSelector,
     EpsilonGreedyCandidateSelector,
     ParetoCandidateSelector,
+    TopKParetoCandidateSelector,
 )
 from gepa.strategies.component_selector import (
     AllReflectionComponentSelector,
@@ -47,7 +49,8 @@ def optimize(
     evaluator: Evaluator | None = None,
     # Reflection-based configuration
     reflection_lm: LanguageModel | str | None = None,
-    candidate_selection_strategy: CandidateSelector | Literal["pareto", "current_best", "epsilon_greedy"] = "pareto",
+    candidate_selection_strategy: CandidateSelector
+    | Literal["pareto", "current_best", "epsilon_greedy", "top_k_pareto"] = "pareto",
     frontier_type: FrontierType = "instance",
     frontier_objective_names: set[str] | None = None,
     skip_perfect_score: bool = True,
@@ -72,10 +75,13 @@ def optimize(
     use_wandb: bool = False,
     wandb_api_key: str | None = None,
     wandb_init_kwargs: dict[str, Any] | None = None,
+    wandb_attach_existing: bool = False,
     use_mlflow: bool = False,
     mlflow_tracking_uri: str | None = None,
     mlflow_experiment_name: str | None = None,
-    track_best_outputs: bool = False,
+    mlflow_attach_existing: bool = False,
+    tracking_key_prefix: str = "",
+    track_best_outputs: bool = True,
     display_progress_bar: bool = False,
     use_cloudpickle: bool = False,
     # Evaluation caching
@@ -84,6 +90,13 @@ def optimize(
     seed: int = 0,
     raise_on_exception: bool = True,
     val_evaluation_policy: EvaluationPolicy[DataId, DataInst] | Literal["full_eval"] | None = None,
+    acceptance_criterion: AcceptanceCriterion
+    | Literal["strict_improvement", "improvement_or_equal"] = "strict_improvement",
+    # ComBEE parallel scan aggregation (https://arxiv.org/abs/2604.04247).
+    # Requires reflection_minibatch_size >= 4 to form k=floor(sqrt(n)) >= 2 groups.
+    use_combee: bool = False,
+    combee_duplication_factor: int = 2,
+    combee_aggregation_prompt: str | None = None,
 ) -> GEPAResult[RolloutOutput, DataId]:
     """
     GEPA is an evolutionary optimizer that evolves (multiple) text components of a complex system to optimize them towards a given metric.
@@ -158,6 +171,8 @@ def optimize(
     - use_wandb: Whether to use Weights and Biases to log the progress of the optimization.
     - wandb_api_key: The API key to use for Weights and Biases.
     - wandb_init_kwargs: Additional keyword arguments to pass to the Weights and Biases initialization.
+    - wandb_attach_existing: When True, log into the already-active W&B run without calling wandb.init() or wandb.finish(). Use when GEPA is embedded in a training loop that owns the run.
+    - mlflow_attach_existing: When True, log into the already-active MLflow run without calling mlflow.start_run() or mlflow.end_run(). Use when GEPA is embedded in a training loop that owns the run.
     - use_mlflow: Whether to use MLflow to log the progress of the optimization.
       Both wandb and mlflow can be used simultaneously if desired.
     - mlflow_tracking_uri: The tracking URI to use for MLflow.
@@ -173,6 +188,14 @@ def optimize(
     - seed: The seed to use for the random number generator.
     - val_evaluation_policy: Strategy controlling which validation ids to score each iteration and which candidate is currently best. Supported strings: "full_eval" (evaluate every id each time) Passing None defaults to "full_eval".
     - raise_on_exception: Whether to propagate proposer/evaluator exceptions instead of stopping gracefully.
+
+    - use_combee: Enable ComBEE parallel scan aggregation (https://arxiv.org/abs/2604.04247).
+      When True, reflections are split into k=floor(sqrt(n)) groups (augmented shuffling + two-level
+      Map-Reduce) to avoid context overload at large batch sizes. Requires reflection_minibatch_size >= 4.
+      Default: False (standard GEPA behaviour).
+    - combee_duplication_factor: Augmented-shuffle duplication count `p` used by ComBEE. Default: 2.
+    - combee_aggregation_prompt: Optional custom Level-2 Reduce prompt used to combine the intermediate
+      ComBEE proposals. Default: None (use GEPA's built-in aggregation prompt).
     """
     # Validate seed_candidate is not None or empty
     if seed_candidate is None or not seed_candidate:
@@ -251,28 +274,20 @@ def optimize(
             + "GEPA will use the default proposer, which requires a reflection_lm to be specified."
         )
 
-
     reflection_lm_callable: LanguageModel | None = None
     if isinstance(reflection_lm, str):
-        import litellm
+        from gepa.lm import LM
 
-        reflection_lm_name = reflection_lm
-
-        def _reflection_lm(prompt: str | list[dict[str, str]]) -> str:
-            if isinstance(prompt, str):
-                completion = litellm.completion(
-                    model=reflection_lm_name, messages=[{"role": "user", "content": prompt}]
-                )
-            else:
-                completion = litellm.completion(model=reflection_lm_name, messages=prompt)
-            return completion.choices[0].message.content  # type: ignore
-
-        reflection_lm_callable = _reflection_lm
+        reflection_lm_callable = LM(reflection_lm)
     else:
         reflection_lm_callable = reflection_lm
 
     if logger is None:
-        logger = StdOutLogger()
+        if run_dir is not None:
+            os.makedirs(run_dir, exist_ok=True)
+            logger = Logger(os.path.join(run_dir, "run_log.txt"))
+        else:
+            logger = StdOutLogger()
 
     rng = random.Random(seed)
 
@@ -282,6 +297,7 @@ def optimize(
             "pareto": lambda: ParetoCandidateSelector(rng=rng),
             "current_best": lambda: CurrentBestCandidateSelector(),
             "epsilon_greedy": lambda: EpsilonGreedyCandidateSelector(epsilon=0.1, rng=rng),
+            "top_k_pareto": lambda: TopKParetoCandidateSelector(k=5, rng=rng),
         }
 
         try:
@@ -289,7 +305,7 @@ def optimize(
         except KeyError as exc:
             raise ValueError(
                 f"Unknown candidate_selector strategy: {candidate_selection_strategy}. "
-                "Supported strategies: 'pareto', 'current_best', 'epsilon_greedy'"
+                "Supported strategies: 'pareto', 'current_best', 'epsilon_greedy', 'top_k_pareto'"
             ) from exc
     elif isinstance(candidate_selection_strategy, CandidateSelector):
         candidate_selector = candidate_selection_strategy
@@ -326,13 +342,36 @@ def optimize(
             "reflection_minibatch_size only accepted if batch_sampler is 'epoch_shuffled'"
         )
 
+    acceptance_criterion_instance: AcceptanceCriterion
+    if isinstance(acceptance_criterion, str):
+        acceptance_factories: dict[str, type[AcceptanceCriterion]] = {
+            "strict_improvement": StrictImprovementAcceptance,
+            "improvement_or_equal": ImprovementOrEqualAcceptance,
+        }
+        try:
+            acceptance_criterion_instance = acceptance_factories[acceptance_criterion]()
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown acceptance_criterion: {acceptance_criterion}. "
+                "Supported strategies: 'strict_improvement', 'improvement_or_equal'"
+            ) from exc
+    elif isinstance(acceptance_criterion, AcceptanceCriterion):
+        acceptance_criterion_instance = acceptance_criterion
+    else:
+        raise TypeError(
+            "acceptance_criterion must be a supported string strategy or an instance of AcceptanceCriterion."
+        )
+
     experiment_tracker = create_experiment_tracker(
         use_wandb=use_wandb,
         wandb_api_key=wandb_api_key,
         wandb_init_kwargs=wandb_init_kwargs,
+        wandb_attach_existing=wandb_attach_existing,
         use_mlflow=use_mlflow,
         mlflow_tracking_uri=mlflow_tracking_uri,
         mlflow_experiment_name=mlflow_experiment_name,
+        mlflow_attach_existing=mlflow_attach_existing,
+        key_prefix=tracking_key_prefix,
     )
 
     if reflection_prompt_template is not None:
@@ -360,6 +399,10 @@ def optimize(
         reflection_prompt_template=reflection_prompt_template,
         custom_candidate_proposer=custom_candidate_proposer,
         callbacks=callbacks,
+        use_combee=use_combee,
+        combee_duplication_factor=combee_duplication_factor,
+        combee_aggregation_prompt=combee_aggregation_prompt,
+        rng=rng,
     )
 
     def evaluator_fn(
@@ -400,11 +443,16 @@ def optimize(
         raise_on_exception=raise_on_exception,
         stop_callback=stop_callback,
         val_evaluation_policy=val_evaluation_policy,
+        acceptance_criterion=acceptance_criterion_instance,
         use_cloudpickle=use_cloudpickle,
         evaluation_cache=evaluation_cache,
     )
 
     with experiment_tracker:
-        state = engine.run()
+        if isinstance(logger, Logger):
+            with logger:
+                state = engine.run()
+        else:
+            state = engine.run()
 
     return GEPAResult.from_state(state, run_dir=run_dir, seed=seed)

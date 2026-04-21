@@ -17,7 +17,7 @@ from gepa.core.data_loader import DataId, DataLoader
 from gepa.core.state import GEPAState, ObjectiveScores, ProgramIdx
 from gepa.gepa_utils import find_dominator_programs
 from gepa.logging.logger import LoggerProtocol
-from gepa.proposer.base import CandidateProposal, ProposeNewCandidate
+from gepa.proposer.base import CandidateProposal, ProposeNewCandidate, SubsampleEvaluation
 
 AncestorLog = tuple[int, int, int]
 MergeDescription = tuple[int, int, tuple[int, ...]]
@@ -391,25 +391,31 @@ class MergeProposer(ProposeNewCandidate[DataId]):
         # Count evals via hook mechanism
         state.increment_evals(actual_evals_count)
 
-        # Build per-objective scores for multi-metric merge acceptance
+        # Build per-objective SubsampleEvaluation for multi-metric merge acceptance
         # Parents: use stored overall objective averages (per-example not available)
         # Merged candidate: compute average from fresh subsample evaluation
-        merge_obj_before = None
-        merge_obj_after = None
+        eval_before_merge: SubsampleEvaluation | None = None
+        eval_after_merge: SubsampleEvaluation | None = None
         parent1_obj = state.prog_candidate_objective_scores[id1]
         parent2_obj = state.prog_candidate_objective_scores[id2]
         if parent1_obj or parent2_obj:
-            merge_obj_before = [parent1_obj, parent2_obj]
+            eval_before_merge = SubsampleEvaluation(
+                scores=[sum(id1_sub_scores), sum(id2_sub_scores)],
+                objective_scores=[parent1_obj, parent2_obj],
+            )
         if objective_by_id:
             new_obj_avg: dict[str, float] = {}
-            obj_names = set()
+            obj_names: set[str] = set()
             for eid in subsample_ids:
                 obj_names.update(objective_by_id[eid].keys())
             for obj_name in obj_names:
                 new_obj_avg[obj_name] = sum(
                     objective_by_id[eid].get(obj_name, 0.0) for eid in subsample_ids
                 ) / len(subsample_ids)
-            merge_obj_after = [new_obj_avg]
+            eval_after_merge = SubsampleEvaluation(
+                scores=new_sub_scores,
+                objective_scores=[new_obj_avg],
+            )
 
         # Acceptance will be evaluated by engine (>= max(parents))
         return CandidateProposal(
@@ -418,8 +424,8 @@ class MergeProposer(ProposeNewCandidate[DataId]):
             subsample_indices=subsample_ids,
             subsample_scores_before=[sum(id1_sub_scores), sum(id2_sub_scores)],
             subsample_scores_after=new_sub_scores,
-            subsample_objective_scores_before=merge_obj_before,
-            subsample_objective_scores_after=merge_obj_after,
+            eval_before=eval_before_merge,
+            eval_after=eval_after_merge,
             tag="merge",
             metadata={"ancestor": ancestor},
         )
