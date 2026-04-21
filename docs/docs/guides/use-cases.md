@@ -402,6 +402,32 @@ Discover how organizations and researchers are using GEPA to optimize AI systems
 
     [:material-arrow-right: Watch the presentation](https://youtu.be/c39fJ2WAj6A?t=6386)
 
+-   **LLMs Are Optimizing Themselves (Matei Zaharia)**
+
+    ---
+
+    Matei Zaharia (Databricks CTO, UC Berkeley) discusses how LLMs are increasingly optimizing themselves through reflective prompt evolution and automated search, arguing this represents a fundamental shift in how AI systems improve.
+
+    [:material-arrow-right: Watch the talk](https://www.youtube.com/watch?v=CtU21gc4gbk)
+
+-   **Why Are Prompt Optimizers Still So Underrated? (Chris Potts)**
+
+    ---
+
+    Chris Potts discusses GEPA at the Bay Area DSPy Meetup (November 2025), making the case for why prompt optimizers are underappreciated and how GEPA's reflective evolution approach changes the optimization landscape.
+
+    [:material-arrow-right: Watch the talk](https://www.youtube.com/watch?v=0bkwd9OYqfk)
+
+-   **Judge the Judge: Building LLM Evaluators That Actually Work with GEPA (AI Engineer)**
+
+    ---
+
+    Mahmoud Mabrouk (CEO, Agenta AI) walks through building a calibrated LLM-as-a-judge — from capturing ground truth to optimizing with GEPA and assessing the judge. Presented at AI Engineer conference, April 2026.
+
+    [:material-arrow-right: Watch the workshop](https://www.youtube.com/watch?v=X4dEHRzBLmc)
+
+    [:material-arrow-right: Workshop repo](https://github.com/Agenta-AI/judge-the-judge)
+
 -   **NeurIPS 2025 Workshop: 12.5% → 62.5% Gains**
 
     ---
@@ -1060,6 +1086,14 @@ Discover how organizations and researchers are using GEPA to optimize AI systems
     Building optimized Text2SQL systems with DSPy and GEPA.
 
     [:material-arrow-right: Read the tutorial](https://www.rajapatnaik.com/blog/2025/10/20/sql-generator)
+
+-   **Optimizing GEPA for Production (Decagon)**
+
+    ---
+
+    Decagon's test-driven approach to deploying GEPA in production, with 19+ ablation experiments on a classification task. Covers data efficiency sweet spots (20-100 examples outperform larger datasets), reflection model selection, and length regularization for 4x prompt compression.
+
+    [:material-arrow-right: Read the blog](https://decagon.ai/blog/optimizing-gepa-for-production)
 
 </div>
 
