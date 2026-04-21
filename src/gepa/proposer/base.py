@@ -16,6 +16,9 @@ class CandidateProposal(Generic[DataId]):
     subsample_indices: list[DataId] | None = None
     subsample_scores_before: list[float] | None = None
     subsample_scores_after: list[float] | None = None
+    # Optional per-example objective scores for multi-metric acceptance
+    subsample_objective_scores_before: list[dict[str, float]] | None = None
+    subsample_objective_scores_after: list[dict[str, float]] | None = None
     # Free-form metadata for logging/trace
     tag: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)

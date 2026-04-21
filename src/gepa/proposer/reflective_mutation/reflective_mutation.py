@@ -382,5 +382,7 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
             subsample_indices=subsample_ids,
             subsample_scores_before=eval_curr.scores,
             subsample_scores_after=new_scores,
+            subsample_objective_scores_before=list(eval_curr.objective_scores) if eval_curr.objective_scores else None,
+            subsample_objective_scores_after=[objective_by_id[eid] for eid in subsample_ids] if objective_by_id else None,
             tag="reflective_mutation",
         )

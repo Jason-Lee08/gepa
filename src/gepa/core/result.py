@@ -47,6 +47,7 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
     val_aggregate_subscores: list[dict[str, float]] | None = None
     per_objective_best_candidates: dict[str, set[ProgramIdx]] | None = None
     objective_pareto_front: dict[str, float] | None = None
+    best_program_per_objective: dict[str, int] | None = None
 
     # Optional data
     best_outputs_valset: dict[DataId, list[tuple[ProgramIdx, RolloutOutput]]] | None = None
@@ -61,7 +62,7 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
     # This is the internal dict key used to wrap str seed_candidates.
     _str_candidate_key: str | None = None
 
-    _VALIDATION_SCHEMA_VERSION: ClassVar[int] = 2
+    _VALIDATION_SCHEMA_VERSION: ClassVar[int] = 3
 
     # -------- Convenience properties --------
     @property
@@ -115,6 +116,7 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
                 else None
             ),
             "objective_pareto_front": self.objective_pareto_front,
+            "best_program_per_objective": self.best_program_per_objective,
             "discovery_eval_counts": self.discovery_eval_counts,
             "total_metric_calls": self.total_metric_calls,
             "num_full_val_evals": self.num_full_val_evals,
@@ -206,6 +208,11 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
         objective_pareto_front = d.get("objective_pareto_front")
         kwargs["objective_pareto_front"] = dict(objective_pareto_front) if objective_pareto_front is not None else None
 
+        best_program_per_objective = d.get("best_program_per_objective")
+        kwargs["best_program_per_objective"] = (
+            dict(best_program_per_objective) if best_program_per_objective is not None else None
+        )
+
         return GEPAResult(**kwargs)
 
     @staticmethod
@@ -228,6 +235,15 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
         }
         objective_front = dict(state.objective_pareto_front)
 
+        # Compute single best program per objective
+        best_per_obj: dict[str, int] = {}
+        for objective, front in state.program_at_pareto_front_objectives.items():
+            if front:
+                best_per_obj[objective] = max(
+                    front,
+                    key=lambda idx: state.prog_candidate_objective_scores[idx].get(objective, float("-inf")),
+                )
+
         return GEPAResult(
             candidates=list(state.program_candidates),
             parents=list(state.parent_program_for_candidate),
@@ -240,6 +256,7 @@ class GEPAResult(Generic[RolloutOutput, DataId]):
             val_aggregate_subscores=(objective_scores_list if has_objective_scores else None),
             per_objective_best_candidates=(per_objective_best if per_objective_best else None),
             objective_pareto_front=objective_front if objective_front else None,
+            best_program_per_objective=best_per_obj if best_per_obj else None,
             discovery_eval_counts=list(state.num_metric_calls_by_discovery),
             total_metric_calls=getattr(state, "total_num_evals", None),
             num_full_val_evals=getattr(state, "num_full_ds_evals", None),

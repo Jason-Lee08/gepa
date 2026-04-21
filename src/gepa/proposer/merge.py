@@ -391,6 +391,26 @@ class MergeProposer(ProposeNewCandidate[DataId]):
         # Count evals via hook mechanism
         state.increment_evals(actual_evals_count)
 
+        # Build per-objective scores for multi-metric merge acceptance
+        # Parents: use stored overall objective averages (per-example not available)
+        # Merged candidate: compute average from fresh subsample evaluation
+        merge_obj_before = None
+        merge_obj_after = None
+        parent1_obj = state.prog_candidate_objective_scores[id1]
+        parent2_obj = state.prog_candidate_objective_scores[id2]
+        if parent1_obj or parent2_obj:
+            merge_obj_before = [parent1_obj, parent2_obj]
+        if objective_by_id:
+            new_obj_avg: dict[str, float] = {}
+            obj_names = set()
+            for eid in subsample_ids:
+                obj_names.update(objective_by_id[eid].keys())
+            for obj_name in obj_names:
+                new_obj_avg[obj_name] = sum(
+                    objective_by_id[eid].get(obj_name, 0.0) for eid in subsample_ids
+                ) / len(subsample_ids)
+            merge_obj_after = [new_obj_avg]
+
         # Acceptance will be evaluated by engine (>= max(parents))
         return CandidateProposal(
             candidate=new_program,
@@ -398,6 +418,8 @@ class MergeProposer(ProposeNewCandidate[DataId]):
             subsample_indices=subsample_ids,
             subsample_scores_before=[sum(id1_sub_scores), sum(id2_sub_scores)],
             subsample_scores_after=new_sub_scores,
+            subsample_objective_scores_before=merge_obj_before,
+            subsample_objective_scores_after=merge_obj_after,
             tag="merge",
             metadata={"ancestor": ancestor},
         )

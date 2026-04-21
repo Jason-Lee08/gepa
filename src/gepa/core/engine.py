@@ -64,6 +64,8 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         experiment_tracker: ExperimentTracker,
         # Callbacks
         callbacks: list[GEPACallback] | None = None,
+        # Multi-metric acceptance
+        frontier_objective_names: set[str] | None = None,
         # Optional parameters
         track_best_outputs: bool = False,
         display_progress_bar: bool = False,
@@ -107,6 +109,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         self.reflective_proposer = reflective_proposer
         self.merge_proposer = merge_proposer
         self.frontier_type: FrontierType = frontier_type
+        self.frontier_objective_names = frontier_objective_names
 
         # Merge scheduling flags (mirroring previous behavior)
         if self.merge_proposer is not None:
@@ -196,6 +199,22 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         if is_best_program:
             self.logger.log(f"Iteration {state.i + 1}: Found a better program on the valset with score {valset_score}.")
+
+        # Log per-objective scores and per-objective bests when multi-metric is active
+        if self.frontier_objective_names:
+            obj_scores = state.prog_candidate_objective_scores[new_program_idx]
+            if obj_scores:
+                obj_str = ", ".join(f"{k}={v:.4f}" for k, v in sorted(obj_scores.items()))
+                self.logger.log(f"Iteration {state.i + 1}: Candidate {new_program_idx} objective scores: {obj_str}")
+                # Show per-objective best programs
+                bests = []
+                for obj_name in sorted(self.frontier_objective_names):
+                    front = state.program_at_pareto_front_objectives.get(obj_name, set())
+                    best_score = state.objective_pareto_front.get(obj_name, float("-inf"))
+                    if front:
+                        bests.append(f"{obj_name}: best={best_score:.4f} (prog {sorted(front)})")
+                if bests:
+                    self.logger.log(f"Iteration {state.i + 1}: Objective frontier: {'; '.join(bests)}")
 
         valset = self.valset
         assert valset is not None
@@ -312,6 +331,23 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             f"over {base_val_coverage} / {len(valset)} examples"
         )
 
+        # Log multi-metric info if enabled
+        if self.frontier_objective_names:
+            base_obj = state.prog_candidate_objective_scores[0]
+            if base_obj:
+                obj_str = ", ".join(f"{k}={v:.4f}" for k, v in sorted(base_obj.items()))
+                self.logger.log(
+                    f"Iteration {state.i + 1}: Multi-metric mode active. "
+                    f"Frontier objectives: {sorted(self.frontier_objective_names)}. "
+                    f"Base objective scores: {obj_str}"
+                )
+            else:
+                self.logger.log(
+                    f"Iteration {state.i + 1}: Multi-metric mode active. "
+                    f"Frontier objectives: {sorted(self.frontier_objective_names)}. "
+                    f"(No objective scores from base eval — objectives will appear after first accepted candidate)"
+                )
+
         # Notify callbacks of optimization start
         notify_callbacks(
             self.callbacks,
@@ -427,7 +463,28 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                                 ),
                             )
 
-                            if new_sum >= max(parent_sums):
+                            merge_accepted = new_sum >= max(parent_sums)
+
+                            # Multi-metric: check frontier objectives if primary didn't accept
+                            if (
+                                not merge_accepted
+                                and self.frontier_objective_names
+                                and proposal.subsample_objective_scores_before
+                                and proposal.subsample_objective_scores_after
+                            ):
+                                for obj_name in self.frontier_objective_names:
+                                    parent_obj_avgs = [
+                                        d.get(obj_name, float("-inf"))
+                                        for d in proposal.subsample_objective_scores_before
+                                    ]
+                                    new_obj_avg = proposal.subsample_objective_scores_after[0].get(
+                                        obj_name, float("-inf")
+                                    )
+                                    if new_obj_avg >= max(parent_obj_avgs):
+                                        merge_accepted = True
+                                        break
+
+                            if merge_accepted:
                                 # ACCEPTED: consume one merge attempt and record it
                                 new_idx, _ = self._run_full_eval_and_add(
                                     new_program=proposal.candidate,
@@ -459,7 +516,8 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                                     ),
                                 )
                                 continue  # skip reflective this iteration
-                            else:
+
+                            if not merge_accepted:
                                 # REJECTED: do NOT consume merges_due or total_merges_tested
                                 self.logger.log(
                                     f"Iteration {state.i + 1}: New program subsample score {new_sum} "
@@ -487,10 +545,33 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     self.logger.log(f"Iteration {state.i + 1}: Reflective mutation did not propose a new candidate")
                     continue
 
-                # Acceptance: require strict improvement on subsample
+                # Acceptance: require strict improvement on subsample (primary or any frontier objective)
                 old_sum = sum(proposal.subsample_scores_before or [])
                 new_sum = sum(proposal.subsample_scores_after or [])
-                if new_sum <= old_sum:
+
+                accepted = new_sum > old_sum
+                accepted_reason = f"primary score: {new_sum} > {old_sum}" if accepted else ""
+
+                # Multi-metric: check frontier objectives if primary didn't accept
+                if (
+                    not accepted
+                    and self.frontier_objective_names
+                    and proposal.subsample_objective_scores_before
+                    and proposal.subsample_objective_scores_after
+                ):
+                    for obj_name in self.frontier_objective_names:
+                        old_obj_sum = sum(
+                            d.get(obj_name, 0.0) for d in proposal.subsample_objective_scores_before
+                        )
+                        new_obj_sum = sum(
+                            d.get(obj_name, 0.0) for d in proposal.subsample_objective_scores_after
+                        )
+                        if new_obj_sum > old_obj_sum:
+                            accepted = True
+                            accepted_reason = f"objective '{obj_name}': {new_obj_sum} > {old_obj_sum}"
+                            break
+
+                if not accepted:
                     self.logger.log(
                         f"Iteration {state.i + 1}: New subsample score {new_sum} is not better than old score {old_sum}, skipping"
                     )
@@ -508,7 +589,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     continue
                 else:
                     self.logger.log(
-                        f"Iteration {state.i + 1}: New subsample score {new_sum} is better than old score {old_sum}. Continue to full eval and add to candidate pool."
+                        f"Iteration {state.i + 1}: Candidate accepted ({accepted_reason}). Continue to full eval and add to candidate pool."
                     )
 
                 # Accept: full eval + add
@@ -574,8 +655,29 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         state.save(self.run_dir, use_cloudpickle=self.use_cloudpickle)
 
-        # Notify optimization end
+        # Log final summary
         best_candidate_idx = self.val_evaluation_policy.get_best_program(state)
+        best_score = self.val_evaluation_policy.get_valset_score(best_candidate_idx, state)
+        self.logger.log(
+            f"\n{'='*60}\n"
+            f"Optimization complete. {len(state.program_candidates)} candidates explored, "
+            f"{state.total_num_evals} metric calls.\n"
+            f"Best program (primary): candidate {best_candidate_idx} (score={best_score:.4f})"
+        )
+        if self.frontier_objective_names:
+            self.logger.log("Per-objective results:")
+            for obj_name in sorted(state.objective_pareto_front.keys()):
+                obj_score = state.objective_pareto_front[obj_name]
+                front = state.program_at_pareto_front_objectives.get(obj_name, set())
+                best_obj_idx = max(
+                    front,
+                    key=lambda idx: state.prog_candidate_objective_scores[idx].get(obj_name, float("-inf")),
+                ) if front else -1
+                marker = " <-- frontier" if obj_name in self.frontier_objective_names else " (tracked)"
+                self.logger.log(f"  {obj_name}: best={obj_score:.4f} -> candidate {best_obj_idx}{marker}")
+        self.logger.log(f"{'='*60}\n")
+
+        # Notify optimization end
         notify_callbacks(
             self.callbacks,
             "on_optimization_end",

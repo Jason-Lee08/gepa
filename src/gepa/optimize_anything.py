@@ -468,6 +468,7 @@ class EngineConfig:
     val_evaluation_policy: EvaluationPolicy | Literal["full_eval"] = "full_eval"
     candidate_selection_strategy: CandidateSelector | Literal["pareto", "current_best", "epsilon_greedy"] = "pareto"
     frontier_type: FrontierType = "hybrid"
+    frontier_objective_names: set[str] | None = None
 
     # Parallelization settings for evaluation
     parallel: bool = False
@@ -1457,6 +1458,7 @@ def optimize_anything(
         reflective_proposer=reflective_proposer,
         merge_proposer=merge_proposer,
         frontier_type=config.engine.frontier_type,
+        frontier_objective_names=config.engine.frontier_objective_names,
         logger=config.tracking.logger,
         experiment_tracker=experiment_tracker,
         callbacks=config.callbacks,

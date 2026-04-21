@@ -142,30 +142,61 @@ Provide the new instructions within ``` blocks."""
     @classmethod
     def output_extractor(cls, lm_out: str) -> dict[str, str]:
         def extract_instruction_text() -> str:
-            # Find the first and last backtick positions (if any)
-            start = lm_out.find("```") + 3
-            end = lm_out.rfind("```")
+            # Find the opening ``` fence (first occurrence).
+            open_pos = lm_out.find("```")
+            if open_pos == -1:
+                return lm_out.strip()
 
-            # Handle if the first and last backticks are the same or overlap
-            if start >= end:
-                # Handle incomplete blocks
+            # Check whether there is a *second* ``` anywhere (distinct position).
+            # If find and rfind land on the same position, there is only one fence.
+            last_pos = lm_out.rfind("```")
+            if last_pos == open_pos:
+                # Only one ``` in the entire string — treat it as a delimiter and
+                # return whichever side has content, matching original behaviour.
                 stripped = lm_out.strip()
                 if stripped.startswith("```"):
-                    # Remove opening ``` and optional language specifier
-                    match = re.match(r"^```\S*\n?", lm_out)
-                    if match:
-                        return lm_out[match.end() :].strip()
+                    m = re.match(r"^```\S*\n?", stripped)
+                    if m:
+                        return stripped[m.end():].strip()
                 elif stripped.endswith("```"):
-                    # Remove closing ```
                     return stripped[:-3].strip()
                 return stripped
 
-            # Skip optional language specifier
-            content = lm_out[start:end]
-            match = re.match(r"^\S*\n", content)
-            if match:
-                content = content[match.end() :]
+            after_open = open_pos + 3
 
-            return content.strip()
+            # Skip an optional language / info specifier on the same line as the
+            # opening fence (e.g. "python", "7", "text").  We only skip it when
+            # the rest of that line has NO spaces — so that lines of actual content
+            # that happen to start right after ``` aren't eaten.
+            content_start = after_open
+            first_nl = lm_out.find("\n", after_open)
+            if first_nl != -1:
+                specifier = lm_out[after_open:first_nl]
+                if specifier and " " not in specifier:
+                    content_start = first_nl + 1
+
+            # Find the closing fence: the LAST ``` that sits alone on its own line
+            # (i.e. preceded by \n and followed only by optional whitespace or
+            # end-of-string).  This pattern avoids matching ``` that open or close
+            # code blocks *inside* the proposed system prompt content.
+            closing_fence_re = re.compile(r"\n```[ \t]*(?:\n|$)")
+            close_match = None
+            for m in closing_fence_re.finditer(lm_out, content_start):
+                close_match = m  # keep the last match
+
+            if close_match is not None:
+                # content runs from content_start up to the \n that begins the fence
+                content = lm_out[content_start : close_match.start()]
+                return content.strip()
+
+            # Fallback: no standalone closing fence found (e.g. truncated response).
+            # Use rfind to find the last ``` and treat it as the closing fence.
+            end = lm_out.rfind("```")
+            if end > open_pos:
+                content = lm_out[content_start:end]
+                return content.strip()
+
+            # No closing fence — return everything after the opening fence.
+            return lm_out[content_start:].strip()
 
         return {"new_instruction": extract_instruction_text()}
