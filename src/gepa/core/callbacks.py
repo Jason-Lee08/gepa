@@ -148,6 +148,9 @@ class ProposalStartEvent(TypedDict):
     """Event for on_proposal_start callback."""
 
     iteration: int
+    """Unique per-proposal identifier. Distinct across parallel proposals."""
+    step: int
+    """Main-loop iteration this proposal belongs to. Shared across all parallel proposals in the same loop pass — use this to group parallel proposals together."""
     parent_candidate: dict[str, str]
     components: list[str]
     reflective_dataset: dict[str, list[dict[str, Any]]]
@@ -157,6 +160,9 @@ class ProposalEndEvent(TypedDict):
     """Event for on_proposal_end callback."""
 
     iteration: int
+    """Unique per-proposal identifier. Matches the iteration of the corresponding ProposalStartEvent."""
+    step: int
+    """Main-loop iteration this proposal belongs to. Shared across all parallel proposals in the same loop pass."""
     new_instructions: dict[str, str]
     prompts: dict[str, str | list[dict[str, Any]]]
     """Per-component prompts sent to the reflection LM (component name → rendered prompt)."""

@@ -40,6 +40,9 @@ class ProposalContext:
     """
 
     iteration: int
+    """Unique per-proposal identifier. Distinct across parallel proposals."""
+    step: int
+    """Main-loop iteration this proposal belongs to. Shared across all parallel proposals in the same loop pass."""
     curr_prog_id: int
     curr_prog: dict[str, str]
     curr_prog_score: float
@@ -179,14 +182,20 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
             raw_lm_outputs[name] = raw_output
         return new_texts, prompts, raw_lm_outputs
 
-    def prepare_proposal(self, state: GEPAState) -> ProposalContext:
+    def prepare_proposal(self, state: GEPAState, step: int | None = None) -> ProposalContext:
         """Select parent candidate and sample minibatch. Must be called sequentially.
 
         Performs the state-dependent, non-parallelizable parts of a proposal:
         candidate selection, minibatch sampling, and callback notifications
         that should fire in order.
+
+        ``step`` is the main-loop iteration this proposal belongs to. When called
+        from a parallel batch, all proposals in the batch share the same ``step``
+        even though their ``iteration`` values differ. Defaults to the proposal's
+        own iteration for sequential callers.
         """
         i = state.i + 1
+        proposal_step = step if step is not None else i
 
         curr_prog_id = self.candidate_selector.select_candidate_idx(state)
         curr_prog = state.program_candidates[curr_prog_id]
@@ -227,6 +236,7 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
 
         return ProposalContext(
             iteration=i,
+            step=proposal_step,
             curr_prog_id=curr_prog_id,
             curr_prog=curr_prog,
             curr_prog_score=curr_prog_score,
@@ -360,6 +370,7 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
                 "on_proposal_start",
                 ProposalStartEvent(
                     iteration=i,
+                    step=ctx.step,
                     parent_candidate=ctx.curr_prog,
                     components=predictor_names_to_update,
                     reflective_dataset=reflective_dataset_concrete,
@@ -375,6 +386,7 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
                 "on_proposal_end",
                 ProposalEndEvent(
                     iteration=i,
+                    step=ctx.step,
                     new_instructions=new_texts,
                     prompts=prompts,
                     raw_lm_outputs=raw_lm_outputs,

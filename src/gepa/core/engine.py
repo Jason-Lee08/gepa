@@ -445,13 +445,17 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         """
         n = self.num_parallel_proposals
 
-        # Step 1: Pre-sample N contexts (sequential)
+        # Step 1: Pre-sample N contexts (sequential).
+        # All N proposals share the same `step` value — the loop iteration
+        # they were dispatched in — so callbacks can group them as one
+        # logical batch even though each gets a unique `iteration` id.
+        step = state.i + 1
         contexts = []
         trace_entries: list[dict] = []
 
         # First context uses the iteration slot already created by the caller
         trace_entry_0 = state.full_program_trace[-1]
-        ctx_0 = self.reflective_proposer.prepare_proposal(state)
+        ctx_0 = self.reflective_proposer.prepare_proposal(state, step=step)
         trace_entry_0["selected_program_candidate"] = ctx_0.curr_prog_id
         trace_entry_0["subsample_ids"] = ctx_0.subsample_ids
         contexts.append(ctx_0)
@@ -463,7 +467,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             state.i += 1
             trace_entry: dict[str, Any] = {"i": state.i}
             state.full_program_trace.append(trace_entry)
-            ctx = self.reflective_proposer.prepare_proposal(state)
+            ctx = self.reflective_proposer.prepare_proposal(state, step=step)
             trace_entry["selected_program_candidate"] = ctx.curr_prog_id
             trace_entry["subsample_ids"] = ctx.subsample_ids
             contexts.append(ctx)
