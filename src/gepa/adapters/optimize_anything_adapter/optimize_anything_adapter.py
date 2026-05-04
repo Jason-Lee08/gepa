@@ -283,12 +283,19 @@ class OptimizeAnythingAdapter(GEPAAdapter):
                 # Each attempt with "side_info" represents an actual evaluator call
                 num_metric_calls += sum(1 for a in attempts if "side_info" in a)
 
+        # Forward per-example metadata from side_info["metadata"] if any example provided it.
+        # This is the user-controlled subset persisted by the engine to
+        # {run_dir}/eval_metadata/iter_{N}_prog_{idx}/task_{example_id}.json.
+        metadata_list = [si.get("metadata") for si in side_infos]
+        metadata = metadata_list if any(m is not None for m in metadata_list) else None
+
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
             trajectories=side_infos,
             objective_scores=objective_scores,
             num_metric_calls=num_metric_calls,
+            metadata=metadata,
         )
 
     def _evaluate_with_refinement(

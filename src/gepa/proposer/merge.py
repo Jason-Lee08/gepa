@@ -5,6 +5,7 @@ import math
 import random
 from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
+from typing import Any
 
 from gepa.core.adapter import Candidate, DataInst, RolloutOutput
 from gepa.core.callbacks import (
@@ -224,7 +225,12 @@ class MergeProposer(ProposeNewCandidate[DataId]):
         valset: DataLoader[DataId, DataInst],
         evaluator: Callable[
             [list[DataInst], dict[str, str]],
-            tuple[list[RolloutOutput], list[float], Sequence[ObjectiveScores] | None],
+            tuple[
+                list[RolloutOutput],
+                list[float],
+                Sequence[ObjectiveScores] | None,
+                Sequence[dict[str, Any] | None] | None,
+            ],
         ],
         use_merge: bool,
         max_merge_invocations: int,
@@ -362,7 +368,7 @@ class MergeProposer(ProposeNewCandidate[DataId]):
             ),
         )
 
-        outputs_by_id, scores_by_id, objective_by_id, actual_evals_count = state.cached_evaluate_full(
+        outputs_by_id, scores_by_id, objective_by_id, _metadata_by_id, actual_evals_count = state.cached_evaluate_full(
             new_program, subsample_ids, self.valset.fetch, self.evaluator
         )
         new_sub_scores = [scores_by_id[eid] for eid in subsample_ids]

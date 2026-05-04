@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Lakshya A Agrawal and the GEPA contributors
 # https://github.com/gepa-ai/gepa
 
+import json
 import os
 import traceback
 from collections.abc import Sequence
@@ -102,9 +103,14 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         def evaluator(
             batch: list[DataInst], program: dict[str, str]
-        ) -> tuple[list[RolloutOutput], list[float], Sequence[dict[str, float]] | None]:
+        ) -> tuple[
+            list[RolloutOutput],
+            list[float],
+            Sequence[dict[str, float]] | None,
+            Sequence[dict[str, Any] | None] | None,
+        ]:
             eval_result = adapter.evaluate(batch, program, capture_traces=False)
-            return eval_result.outputs, eval_result.scores, eval_result.objective_scores
+            return eval_result.outputs, eval_result.scores, eval_result.objective_scores, eval_result.metadata
 
         self.evaluator = evaluator
 
@@ -164,15 +170,20 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         val_ids = self.val_evaluation_policy.get_eval_batch(valset, state)
 
-        outputs_by_val_idx, scores_by_val_idx, objective_by_val_idx, num_actual_evals = state.cached_evaluate_full(
-            program, list(val_ids), valset.fetch, self.evaluator
-        )
+        (
+            outputs_by_val_idx,
+            scores_by_val_idx,
+            objective_by_val_idx,
+            metadata_by_val_idx,
+            num_actual_evals,
+        ) = state.cached_evaluate_full(program, list(val_ids), valset.fetch, self.evaluator)
         state.increment_evals(num_actual_evals)
 
         return ValsetEvaluation(
             outputs_by_val_id=outputs_by_val_idx,
             scores_by_val_id=scores_by_val_idx,
             objective_scores_by_val_id=objective_by_val_idx,
+            metadata_by_val_id=metadata_by_val_idx,
         )
 
     def _run_full_eval_and_add(
@@ -197,6 +208,12 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             valset_evaluation=valset_evaluation,
             run_dir=self.run_dir,
             num_metric_calls_by_discovery_of_new_program=num_metric_calls_by_discovery,
+        )
+
+        self._write_eval_metadata(
+            iteration=state.i + 1,
+            candidate_idx=new_program_idx,
+            valset_evaluation=valset_evaluation,
         )
 
         # Compute best program immediately after state update (before callbacks)
@@ -533,16 +550,22 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             program: dict[str, str],
         ) -> ValsetEvaluation[RolloutOutput, DataId]:
             all_ids = list(valset.all_ids())
-            outputs, scores, objective_scores = self.evaluator(valset.fetch(all_ids), program)
+            outputs, scores, objective_scores, metadata = self.evaluator(valset.fetch(all_ids), program)
             outputs_dict = dict(zip(all_ids, outputs, strict=False))
             scores_dict = dict(zip(all_ids, scores, strict=False))
             objective_scores_dict = (
                 dict(zip(all_ids, objective_scores, strict=False)) if objective_scores is not None else None
             )
+            metadata_dict: dict[DataId, dict[str, Any]] | None = None
+            if metadata is not None:
+                metadata_dict = {
+                    eid: m for eid, m in zip(all_ids, metadata, strict=False) if m is not None
+                } or None
             return ValsetEvaluation(
                 outputs_by_val_id=outputs_dict,
                 scores_by_val_id=scores_dict,
                 objective_scores_by_val_id=objective_scores_dict,
+                metadata_by_val_id=metadata_dict,
             )
 
         # Notify callbacks of optimization start (before seed valset eval)
@@ -563,6 +586,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Evaluate seed candidate on valset (after on_optimization_start callback)
         seed_valset_evaluation = valset_evaluator(self.seed_candidate)
+        self._write_eval_metadata(iteration=0, candidate_idx=0, valset_evaluation=seed_valset_evaluation)
 
         # Initialize state with pre-computed seed evaluation
         state = initialize_gepa_state(
@@ -976,6 +1000,28 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             ],
             data=rows,
         )
+
+    def _write_eval_metadata(
+        self,
+        iteration: int,
+        candidate_idx: int,
+        valset_evaluation: ValsetEvaluation[RolloutOutput, DataId],
+    ) -> None:
+        """Write per-example evaluation metadata to disk.
+
+        Layout: {run_dir}/eval_metadata/iter_{iteration}_prog_{candidate_idx}/task_{example_id}.json
+        No-op if run_dir is unset or no metadata was produced (e.g. all examples were cache hits).
+        """
+        if self.run_dir is None or not valset_evaluation.metadata_by_val_id:
+            return
+        from gepa.gepa_utils import json_default
+
+        out_dir = os.path.join(self.run_dir, "eval_metadata", f"iter_{iteration}_prog_{candidate_idx}")
+        os.makedirs(out_dir, exist_ok=True)
+        for eid, meta in valset_evaluation.metadata_by_val_id.items():
+            path = os.path.join(out_dir, f"task_{eid}.json")
+            with open(path, "w") as f:
+                json.dump(meta, f, indent=2, default=json_default)
 
     def _log_candidate_tree(self, state: GEPAState[RolloutOutput, DataId]) -> None:
         """Generate and log the candidate tree visualization."""

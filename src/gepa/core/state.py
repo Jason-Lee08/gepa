@@ -96,18 +96,30 @@ class EvaluationCache(Generic[RolloutOutput, DataId]):
         candidate: dict[str, str],
         example_ids: list[DataId],
         fetcher: Callable[[list[DataId]], Any],
-        evaluator: Callable[[Any, dict[str, str]], tuple[Any, list[float], Sequence[ObjectiveScores] | None]],
-    ) -> tuple[dict[DataId, RolloutOutput], dict[DataId, float], dict[DataId, ObjectiveScores] | None, int]:
+        evaluator: Callable[
+            [Any, dict[str, str]],
+            tuple[Any, list[float], Sequence[ObjectiveScores] | None, Sequence[dict[str, Any] | None] | None],
+        ],
+    ) -> tuple[
+        dict[DataId, RolloutOutput],
+        dict[DataId, float],
+        dict[DataId, ObjectiveScores] | None,
+        dict[DataId, dict[str, Any]] | None,
+        int,
+    ]:
         """
         Evaluate using cache, returning full results.
 
-        Returns (outputs_by_id, scores_by_id, objective_scores_by_id, num_actual_evals).
+        Returns (outputs_by_id, scores_by_id, objective_scores_by_id, metadata_by_id, num_actual_evals).
+        Metadata is not cached — only uncached (freshly evaluated) examples appear in metadata_by_id.
+        Per-example metadata entries that are None are also dropped.
         """
         cached, uncached_ids = self.get_batch(candidate, example_ids)
 
         outputs_by_id: dict[DataId, RolloutOutput] = {eid: c.output for eid, c in cached.items()}
         scores_by_id: dict[DataId, float] = {eid: c.score for eid, c in cached.items()}
         objective_by_id: dict[DataId, ObjectiveScores] | None = None
+        metadata_by_id: dict[DataId, dict[str, Any]] | None = None
 
         # Populate objective scores from cache
         for eid, c in cached.items():
@@ -118,16 +130,21 @@ class EvaluationCache(Generic[RolloutOutput, DataId]):
         # Evaluate uncached examples
         if uncached_ids:
             batch = fetcher(uncached_ids)
-            outputs, scores, obj_scores = evaluator(batch, candidate)
+            outputs, scores, obj_scores, metadata = evaluator(batch, candidate)
             for idx, eid in enumerate(uncached_ids):
                 outputs_by_id[eid] = outputs[idx]
                 scores_by_id[eid] = scores[idx]
                 if obj_scores is not None:
                     objective_by_id = objective_by_id or {}
                     objective_by_id[eid] = obj_scores[idx]
+                if metadata is not None:
+                    meta_entry = metadata[idx]
+                    if meta_entry is not None:
+                        metadata_by_id = metadata_by_id or {}
+                        metadata_by_id[eid] = meta_entry
             self.put_batch(candidate, uncached_ids, outputs, scores, obj_scores)
 
-        return outputs_by_id, scores_by_id, objective_by_id, len(uncached_ids)
+        return outputs_by_id, scores_by_id, objective_by_id, metadata_by_id, len(uncached_ids)
 
 
 @dataclass(slots=True)
@@ -137,6 +154,7 @@ class ValsetEvaluation(Generic[RolloutOutput, DataId]):
     outputs_by_val_id: dict[DataId, RolloutOutput]
     scores_by_val_id: dict[DataId, float]
     objective_scores_by_val_id: dict[DataId, ObjectiveScores] | None = None
+    metadata_by_val_id: dict[DataId, dict[str, Any]] | None = None
 
 
 class GEPAState(Generic[RolloutOutput, DataId]):
@@ -609,10 +627,13 @@ class GEPAState(Generic[RolloutOutput, DataId]):
         candidate: dict[str, str],
         example_ids: list[DataId],
         fetcher: Callable[[list[DataId]], Any],
-        evaluator: Callable[[Any, dict[str, str]], tuple[Any, list[float], Sequence[ObjectiveScores] | None]],
+        evaluator: Callable[
+            [Any, dict[str, str]],
+            tuple[Any, list[float], Sequence[ObjectiveScores] | None, Sequence[dict[str, Any] | None] | None],
+        ],
     ) -> tuple[list[float], int]:
         """Evaluate with optional caching. Returns (scores, num_actual_evals)."""
-        _, scores_by_id, _, num_actual_evals = self.cached_evaluate_full(candidate, example_ids, fetcher, evaluator)
+        _, scores_by_id, _, _, num_actual_evals = self.cached_evaluate_full(candidate, example_ids, fetcher, evaluator)
         return [scores_by_id[eid] for eid in example_ids], num_actual_evals
 
     def cached_evaluate_full(
@@ -620,17 +641,35 @@ class GEPAState(Generic[RolloutOutput, DataId]):
         candidate: dict[str, str],
         example_ids: list[DataId],
         fetcher: Callable[[list[DataId]], Any],
-        evaluator: Callable[[Any, dict[str, str]], tuple[Any, list[float], Sequence[ObjectiveScores] | None]],
-    ) -> tuple[dict[DataId, RolloutOutput], dict[DataId, float], dict[DataId, ObjectiveScores] | None, int]:
-        """Evaluate with optional caching, returning full results."""
+        evaluator: Callable[
+            [Any, dict[str, str]],
+            tuple[Any, list[float], Sequence[ObjectiveScores] | None, Sequence[dict[str, Any] | None] | None],
+        ],
+    ) -> tuple[
+        dict[DataId, RolloutOutput],
+        dict[DataId, float],
+        dict[DataId, ObjectiveScores] | None,
+        dict[DataId, dict[str, Any]] | None,
+        int,
+    ]:
+        """Evaluate with optional caching, returning full results.
+
+        Returns (outputs_by_id, scores_by_id, objective_scores_by_id, metadata_by_id, num_actual_evals).
+        Metadata is never cached — on cache hits, no metadata entry is produced for that example.
+        """
         if self.evaluation_cache is not None:
             return self.evaluation_cache.evaluate_with_cache_full(candidate, example_ids, fetcher, evaluator)
         batch = fetcher(example_ids)
-        outputs, scores, objective_scores = evaluator(batch, candidate)
+        outputs, scores, objective_scores, metadata = evaluator(batch, candidate)
         outputs_by_id = dict(zip(example_ids, outputs, strict=False))
         scores_by_id = dict(zip(example_ids, scores, strict=False))
         objective_by_id = dict(zip(example_ids, objective_scores, strict=False)) if objective_scores else None
-        return outputs_by_id, scores_by_id, objective_by_id, len(example_ids)
+        metadata_by_id: dict[DataId, dict[str, Any]] | None = None
+        if metadata:
+            metadata_by_id = {
+                eid: m for eid, m in zip(example_ids, metadata, strict=False) if m is not None
+            } or None
+        return outputs_by_id, scores_by_id, objective_by_id, metadata_by_id, len(example_ids)
 
 
 def write_eval_scores_to_directory(scores: dict[DataId, float], output_dir: str) -> None:
