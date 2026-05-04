@@ -283,10 +283,11 @@ class OptimizeAnythingAdapter(GEPAAdapter):
                 # Each attempt with "side_info" represents an actual evaluator call
                 num_metric_calls += sum(1 for a in attempts if "side_info" in a)
 
-        # Forward per-example metadata from side_info["metadata"] if any example provided it.
-        # This is the user-controlled subset persisted by the engine to
-        # {run_dir}/eval_metadata/iter_{N}_prog_{idx}/task_{example_id}.json.
-        metadata_list = [si.get("metadata") for si in side_infos]
+        # Forward per-example metadata from side_info["_metadata"] if any example provided it.
+        # The leading underscore signals "not for the reflection LM" — make_reflective_dataset
+        # drops underscore-prefixed keys. This is the user-controlled subset persisted by the
+        # engine to {run_dir}/eval_metadata/iter_{N}_prog_{idx}/task_{example_id}.json.
+        metadata_list = [si.get("_metadata") for si in side_infos]
         metadata = metadata_list if any(m is not None for m in metadata_list) else None
 
         return EvaluationBatch(
@@ -558,8 +559,9 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         For each component being updated, produces a list of dicts (one per
         example) combining shared SideInfo fields with any
         ``<component>_specific_info`` data.  Tracking-only keys (see
-        ``_REFLECTION_EXCLUDED_KEYS``) are stripped so they don't appear
-        in the reflection prompt.
+        ``_REFLECTION_EXCLUDED_KEYS``) and underscore-prefixed keys (the
+        convention for evaluator-private payloads, e.g. ``_metadata``) are
+        stripped so they don't appear in the reflection prompt.
         """
         scores, side_infos = eval_batch.scores, eval_batch.trajectories
         assert side_infos is not None
@@ -569,7 +571,7 @@ class OptimizeAnythingAdapter(GEPAAdapter):
             for score, side_info in zip(scores, side_infos, strict=False):
                 ret[component_name].append({})
                 for k, v in side_info.items():
-                    if k in self._REFLECTION_EXCLUDED_KEYS:
+                    if k in self._REFLECTION_EXCLUDED_KEYS or k.startswith("_"):
                         continue
                     elif not k.endswith("_specific_info"):
                         ret[component_name][-1][k] = v
