@@ -500,15 +500,129 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                         ),
                     )
 
-        # Step 3: Process acceptances sequentially
-        any_accepted = False
-        for _idx, (ctx, trace_entry, output) in enumerate(zip(contexts, trace_entries, outputs, strict=False)):
+        # Step 3: Pick a single winner by max percentage improvement, then process it.
+        # Apply non-acceptance state mutations for every output so reflective state
+        # (e.g. component selection bookkeeping) is consistent with the sequential path.
+        epsilon = 0.01
+        eligible: list[tuple[float, str, Any, Any]] = []  # (pct, metric, ctx, output)
+        for ctx, trace_entry, output in zip(contexts, trace_entries, outputs, strict=False):
             if output is None:
                 continue
-            if self._process_proposal_output(output, ctx.iteration, trace_entry, state):
-                any_accepted = True
+            self.reflective_proposer.apply_proposal_output(output, state)
+            trace_entry.update(output.trace_data)
+            proposal = output.proposal
+            if proposal is None:
+                self.logger.log(f"Iteration {ctx.iteration}: Reflective mutation did not propose a new candidate")
+                continue
 
-        return any_accepted
+            best_pct, best_metric = self._proposal_best_pct_improvement(proposal, epsilon)
+            if best_pct is None or best_pct <= 0.0:
+                continue
+            eligible.append((best_pct, best_metric, ctx, output))
+
+        if not eligible:
+            # All proposals failed to improve any tracked metric — log each as rejected.
+            for ctx, _trace_entry, output in zip(contexts, trace_entries, outputs, strict=False):
+                if output is None or output.proposal is None:
+                    continue
+                self._reject_parallel_proposal(
+                    proposal=output.proposal,
+                    iteration=ctx.iteration,
+                    reason="No tracked metric improved over parent",
+                )
+            return False
+
+        winner_pct, winner_metric, winner_ctx, winner_output = max(eligible, key=lambda x: x[0])
+
+        self.logger.log(
+            f"Iteration {winner_ctx.iteration}: Selected winner of parallel batch "
+            f"(metric '{winner_metric}' improved by {winner_pct:.2%})"
+        )
+
+        # Log losers as rejected so their LM calls remain accounted for.
+        for pct, metric, ctx, output in eligible:
+            if ctx.iteration == winner_ctx.iteration:
+                continue
+            self._reject_parallel_proposal(
+                proposal=output.proposal,
+                iteration=ctx.iteration,
+                reason=(
+                    f"Superseded in parallel batch by iteration {winner_ctx.iteration} "
+                    f"(this proposal: '{metric}' +{pct:.2%}; winner: '{winner_metric}' +{winner_pct:.2%})"
+                ),
+            )
+
+        # Run the winner through the standard acceptance + full-eval path.
+        accepted = self._accept_reflective_proposal(winner_output.proposal, winner_ctx.iteration, state)
+
+        if accepted and self.merge_proposer is not None:
+            self.merge_proposer.last_iter_found_new_program = True
+            if self.merge_proposer.total_merges_tested < self.merge_proposer.max_merge_invocations:
+                self.merge_proposer.merges_due += 1
+
+        return accepted
+
+    def _proposal_best_pct_improvement(
+        self,
+        proposal: CandidateProposal,
+        epsilon: float,
+    ) -> tuple[float | None, str]:
+        """Best ε-smoothed percentage improvement across tracked metrics.
+
+        Tracked metrics are ``frontier_objective_names`` if multi-objective mode
+        is active, otherwise the primary scalar score. Per-example values are
+        summed across the minibatch (matching the acceptance gate at line 350).
+        Negative baselines are clamped to 0 since scores are assumed non-negative.
+
+        Returns ``(pct, metric_name)`` for the best-improving metric, or
+        ``(None, "")`` when no eval data is available.
+        """
+
+        def smoothed_pct(old: float, new: float) -> float:
+            old_clamped = max(old, 0.0)
+            return (new - old_clamped) / (old_clamped + epsilon)
+
+        if self.frontier_objective_names:
+            before_obj = proposal.eval_before.objective_scores if proposal.eval_before else None
+            after_obj = proposal.eval_after.objective_scores if proposal.eval_after else None
+            if not before_obj or not after_obj:
+                return None, ""
+            best_pct: float | None = None
+            best_metric = ""
+            for obj_name in self.frontier_objective_names:
+                old_sum = sum(d.get(obj_name, 0.0) for d in before_obj)
+                new_sum = sum(d.get(obj_name, 0.0) for d in after_obj)
+                pct = smoothed_pct(old_sum, new_sum)
+                if best_pct is None or pct > best_pct:
+                    best_pct = pct
+                    best_metric = obj_name
+            return best_pct, best_metric
+
+        old_sum = sum(proposal.subsample_scores_before or [])
+        new_sum = sum(proposal.subsample_scores_after or [])
+        return smoothed_pct(old_sum, new_sum), "primary"
+
+    def _reject_parallel_proposal(
+        self,
+        proposal: CandidateProposal,
+        iteration: int,
+        reason: str,
+    ) -> None:
+        """Log a parallel-batch loser as rejected (LM calls + callback)."""
+        old_sum = sum(proposal.subsample_scores_before or [])
+        new_sum = sum(proposal.subsample_scores_after or [])
+        self.logger.log(f"Iteration {iteration}: Candidate rejected — {reason}")
+        self._log_proposal_lm_calls(iteration, proposal, candidate_idx=-1)
+        notify_callbacks(
+            self.callbacks,
+            "on_candidate_rejected",
+            CandidateRejectedEvent(
+                iteration=iteration,
+                old_score=old_sum,
+                new_score=new_sum,
+                reason=reason,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Main optimization loop
@@ -562,9 +676,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             )
             metadata_dict: dict[DataId, dict[str, Any]] | None = None
             if metadata is not None:
-                metadata_dict = {
-                    eid: m for eid, m in zip(all_ids, metadata, strict=False) if m is not None
-                } or None
+                metadata_dict = {eid: m for eid, m in zip(all_ids, metadata, strict=False) if m is not None} or None
             return ValsetEvaluation(
                 outputs_by_val_id=outputs_dict,
                 scores_by_val_id=scores_dict,
@@ -781,12 +893,9 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                             ):
                                 for obj_name in self.frontier_objective_names:
                                     parent_obj_avgs = [
-                                        d.get(obj_name, float("-inf"))
-                                        for d in proposal.eval_before.objective_scores
+                                        d.get(obj_name, float("-inf")) for d in proposal.eval_before.objective_scores
                                     ]
-                                    new_obj_avg = proposal.eval_after.objective_scores[0].get(
-                                        obj_name, float("-inf")
-                                    )
+                                    new_obj_avg = proposal.eval_after.objective_scores[0].get(obj_name, float("-inf"))
                                     if new_obj_avg >= max(parent_obj_avgs):
                                         merge_accepted = True
                                         break
@@ -897,7 +1006,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         best_candidate_idx = self.val_evaluation_policy.get_best_program(state)
         best_score = self.val_evaluation_policy.get_valset_score(best_candidate_idx, state)
         self.logger.log(
-            f"\n{'='*60}\n"
+            f"\n{'=' * 60}\n"
             f"Optimization complete. {len(state.program_candidates)} candidates explored, "
             f"{state.total_num_evals} metric calls.\n"
             f"Best program (primary): candidate {best_candidate_idx} (score={best_score:.4f})"
@@ -907,13 +1016,17 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             for obj_name in sorted(state.objective_pareto_front.keys()):
                 obj_score = state.objective_pareto_front[obj_name]
                 front = state.program_at_pareto_front_objectives.get(obj_name, set())
-                best_obj_idx = max(
-                    front,
-                    key=lambda idx: state.prog_candidate_objective_scores[idx].get(obj_name, float("-inf")),
-                ) if front else -1
+                best_obj_idx = (
+                    max(
+                        front,
+                        key=lambda idx: state.prog_candidate_objective_scores[idx].get(obj_name, float("-inf")),
+                    )
+                    if front
+                    else -1
+                )
                 marker = " <-- frontier" if obj_name in self.frontier_objective_names else " (tracked)"
                 self.logger.log(f"  {obj_name}: best={obj_score:.4f} -> candidate {best_obj_idx}{marker}")
-        self.logger.log(f"{'='*60}\n")
+        self.logger.log(f"{'=' * 60}\n")
 
         # Notify optimization end
         notify_callbacks(
@@ -957,11 +1070,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         ``"candidates"`` table in WandB / MLflow.
         """
         metadata = proposal.metadata or {}
-        components = {
-            k.split(":", 1)[1]
-            for k in metadata
-            if k.startswith("prompt:") or k.startswith("raw_lm_output:")
-        }
+        components = {k.split(":", 1)[1] for k in metadata if k.startswith("prompt:") or k.startswith("raw_lm_output:")}
         if not components:
             return
 
@@ -975,18 +1084,20 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             prompt = metadata.get(f"prompt:{comp}", "")
             raw_output = metadata.get(f"raw_lm_output:{comp}", "")
             proposed_text = proposal.candidate.get(comp, "")
-            rows.append([
-                iteration,
-                comp,
-                status,
-                candidate_idx,
-                parent_ids_str,
-                subsample_before,
-                subsample_after,
-                prompt if isinstance(prompt, str) else str(prompt),
-                raw_output,
-                proposed_text,
-            ])
+            rows.append(
+                [
+                    iteration,
+                    comp,
+                    status,
+                    candidate_idx,
+                    parent_ids_str,
+                    subsample_before,
+                    subsample_after,
+                    prompt if isinstance(prompt, str) else str(prompt),
+                    raw_output,
+                    proposed_text,
+                ]
+            )
 
         self.experiment_tracker.log_table(
             "proposals",
